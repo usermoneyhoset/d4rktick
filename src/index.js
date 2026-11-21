@@ -570,7 +570,7 @@ async function submitPayment(interaction, env, orderNumber) {
 
 async function orderAction(interaction, env, action, orderNumber) {
   if (!isStaff(interaction, env)) return editOriginalResponse(interaction, 'â Only D4rk staff can use these order controls.');
-  const order = await env.DB.prepare(`SELECT o.id, o.user_id, o.amount_cents, o.status, o.variant_id, o.payment_method, o.discord_channel_id, u.discord_id, p.name AS product_name, v.name AS variant_name FROM orders o JOIN users u ON u.id = o.user_id JOIN products p ON p.id = o.product_id JOIN product_variants v ON v.id = o.variant_id WHERE o.order_number = ?`).bind(orderNumber).first();
+  const order = await env.DB.prepare(`SELECT o.id, o.order_number, o.user_id, o.amount_cents, o.status, o.variant_id, o.payment_method, o.discord_channel_id, u.discord_id, p.name AS product_name, v.name AS variant_name FROM orders o JOIN users u ON u.id = o.user_id JOIN products p ON p.id = o.product_id JOIN product_variants v ON v.id = o.variant_id WHERE o.order_number = ?`).bind(orderNumber).first();
   if (!order) return editOriginalResponse(interaction, 'â Order not found.');
 
   if (action === 'paid') {
@@ -668,7 +668,7 @@ async function createOrder(interaction, env) {
 async function approveOrder(interaction, env) {
   if (!isStaff(interaction, env)) return 'â Staff only.';
   const orderNumber = getOption(interaction, 'order');
-  const order = await env.DB.prepare(`SELECT o.id, o.user_id, o.amount_cents, o.status, o.variant_id, o.payment_method, o.discord_channel_id, u.discord_id, p.name AS product_name, v.name AS variant_name FROM orders o JOIN users u ON u.id = o.user_id JOIN products p ON p.id = o.product_id JOIN product_variants v ON v.id = o.variant_id WHERE o.order_number = ?`).bind(orderNumber).first();
+  const order = await env.DB.prepare(`SELECT o.id, o.order_number, o.user_id, o.amount_cents, o.status, o.variant_id, o.payment_method, o.discord_channel_id, u.discord_id, p.name AS product_name, v.name AS variant_name FROM orders o JOIN users u ON u.id = o.user_id JOIN products p ON p.id = o.product_id JOIN product_variants v ON v.id = o.variant_id WHERE o.order_number = ?`).bind(orderNumber).first();
   if (!order || !['pending_payment', 'payment_submitted', 'paid'].includes(order.status)) return 'â Order not found or cannot be approved.';
 
   if (order.status !== 'paid') {
