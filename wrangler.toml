@@ -1,14 +1,14 @@
-name = “d4rktick”
-main = “src/index.js”
-compatibility_date = “2026-11-21”
+name = "d4rktick"
+main = "src/index.js"
+compatibility_date = "2026-11-21"
 
 [[d1_databases]]
-binding = “DB”
-database_name = “d4rk-tickets”
-database_id = “af2bc035-eb6d-47cc-ad8d-3ea671d5f87e”
+binding = "DB"
+database_name = "d4rk-tickets"
+database_id = "af2bc035-eb6d-47cc-ad8d-3ea671d5f87e"
 
 [vars]
-APPLICATION_ID = “1573691824617431162”
-GUILD_ID = “1518624035460878367”
-PUBLIC_KEY = “b2069b6dba11137402403cfc412f3a03f8a1b37597cc0ae9e785f962d1cf7861”
-STAFF_ROLE_ID = “1518624855531065586”
+APPLICATION_ID = "1573691824617431162"
+GUILD_ID = "1518624035460878367"
+PUBLIC_KEY = "b2069b6dba11137402403cfc412f3a03f8a1b37597cc0ae9e785f962d1cf7861"
+STAFF_ROLE_ID = "1518624855531065586"
