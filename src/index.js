@@ -1,62 +1,713 @@
+const DISCORD_API = "https://discord.com/api/v10";
+const SESSION_DURATION = 7 * 24 * 60 * 60;
+const OAUTH_STATE_DURATION = 10 * 60;
+
+function json(data, status = 200, headers = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json", ...headers }
+  });
+}
+
+function randomToken(bytes = 32) {
+  const array = crypto.getRandomValues(new Uint8Array(bytes));
+  return btoa(String.fromCharCode(...array))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+}
+
+async function hash(value) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+function getCookie(request, name) {
+  for (const cookie of (request.headers.get("Cookie") || "").split(";")) {
+    const [key, ...value] = cookie.trim().split("=");
+    if (key === name) return value.join("=");
+  }
+  return null;
+}
+
+function sessionCookie(token, maxAge = SESSION_DURATION) {
+  return [`d4rk_session=${token}`, "HttpOnly", "Secure", "SameSite=Lax", "Path=/", `Max-Age=${maxAge}`].join("; ");
+}
+
+function getInteractionUser(interaction) {
+  return interaction.member?.user || interaction.user || null;
+}
+function getInteractionUserId(interaction) {
+  return getInteractionUser(interaction)?.id || null;
+}
+function getOption(interaction, name) {
+  return interaction.data?.options?.find(o => o.name === name)?.value;
+}
+function isStaff(interaction, env) {
+  return Boolean(env.STAFF_ROLE_ID && interaction.member?.roles?.includes(env.STAFF_ROLE_ID));
+}
+function money(cents) {
+  return `€${(Number(cents || 0) / 100).toFixed(2)}`;
+}
+function parseAmount(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  const cents = Math.round(value * 100);
+  return cents <= 0 || cents > 100000000 ? null : cents;
+}
+function safeText(value, max = 100) {
+  return String(value || "").replace(/[\r\n]/g, " ").slice(0, max);
+}
+function ephemeral(content, extra = {}) {
+  return { type: 4, data: { content, flags: 64, ...extra } };
+}
+function embed(title, description, color = 0x5865F2) {
+  return { title, description, color, footer: { text: "D4rk • Customer Store" }, timestamp: new Date().toISOString() };
+}
+
+async function verifySignature(request, body, publicKeyHex) {
+  const signature = request.headers.get("X-Signature-Ed25519");
+  const timestamp = request.headers.get("X-Signature-Timestamp");
+  if (!signature || !timestamp || !publicKeyHex) return false;
+  try {
+    const hexToBytes = hex => new Uint8Array(hex.match(/.{2}/g).map(b => parseInt(b, 16)));
+    const key = await crypto.subtle.importKey("raw", hexToBytes(publicKeyHex), { name: "Ed25519" }, false, ["verify"]);
+    return await crypto.subtle.verify({ name: "Ed25519" }, key, hexToBytes(signature), new TextEncoder().encode(timestamp + body));
+  } catch { return false; }
+}
+
+async function discordRequest(env, path, method = "GET", data = null) {
+  const response = await fetch(`${DISCORD_API}${path}`, {
+    method,
+    headers: { Authorization: `Bot ${env.DISCORD_TOKEN}`, "Content-Type": "application/json" },
+    ...(data ? { body: JSON.stringify(data) } : {})
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(`Discord API ${response.status}: ${JSON.stringify(result)}`);
+  return result;
+}
+
+async function editOriginalResponse(interaction, data) {
+  return fetch(`${DISCORD_API}/webhooks/${interaction.application_id}/${interaction.token}/messages/@original`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(typeof data === "string" ? { content: data, embeds: [], components: [] } : data)
+  });
+}
+
+async function createPrivateChannel(env, guildId, user, name, topic) {
+  if (!guildId || !user?.id) throw new Error("Guild or user missing");
+  const permissions = "68608";
+  const overwrites = [
+    { id: guildId, type: 0, deny: "1024" },
+    { id: user.id, type: 1, allow: permissions }
+  ];
+  if (env.STAFF_ROLE_ID) overwrites.push({ id: env.STAFF_ROLE_ID, type: 0, allow: permissions });
+  return discordRequest(env, `/guilds/${guildId}/channels`, "POST", {
+    name, type: 0,
+    ...(env.TICKET_CATEGORY_ID ? { parent_id: env.TICKET_CATEGORY_ID } : {}),
+    permission_overwrites: overwrites,
+    topic
+  });
+}
+
+async function createTicket(interaction, env) {
+  const user = getInteractionUser(interaction);
+  const username = safeText(user?.username || "user", 50).toLowerCase().replace(/[^a-z0-9-]/g, "-");
+  const channel = await createPrivateChannel(env, interaction.guild_id, user, `ticket-${username}`, `D4rk support | ${user.username} | ${user.id}`);
+  await discordRequest(env, `/channels/${channel.id}/messages`, "POST", {
+    content: `Welcome <@${user.id}> to your D4rk ticket!\n\nPlease explain your request. Our staff will assist you.`
+  });
+  return channel;
+}
+
+// ---------------- BALANCE + TRANSACTIONS ----------------
+
+async function balanceCommand(interaction, env) {
+  const discordId = getInteractionUserId(interaction);
+  const user = await env.DB.prepare("SELECT balance FROM users WHERE discord_id = ?").bind(discordId).first();
+  if (!user) return "Your D4rk account was not found. Please log in first.";
+  return `💰 Your D4rk balance: **${money(user.balance)}**`;
+}
+
 async function changeBalance(interaction, env, type) {
-  if (!isStaff(interaction, env)) {
-    return "❌ You are not authorized to use this command.";
-  }
-
-  const actor = interaction.member?.user || interaction.user;
-
-  if (!actor?.id) {
-    return "❌ Unable to identify the staff member.";
-  }
-
+  if (!isStaff(interaction, env)) return "❌ You are not authorized to use this command.";
+  const actorId = getInteractionUserId(interaction);
   const discordId = getOption(interaction, "user");
   const cents = parseAmount(getOption(interaction, "amount"));
   const reason = getOption(interaction, "reason") || "Staff adjustment";
-
+  if (!discordId || !/^\d{17,20}$/.test(discordId)) return "❌ Invalid customer Discord ID.";
   if (!cents) return "❌ Invalid amount.";
-
-  const user = await env.DB.prepare(
-    "SELECT id FROM users WHERE discord_id = ?"
-  ).bind(discordId).first();
-
-  if (!user) return "❌ Customer account not found.";
-
+  const user = await env.DB.prepare("SELECT id FROM users WHERE discord_id = ?").bind(discordId).first();
+  if (!user) return "❌ Customer account not found. The customer must log in first.";
   const change = type === "credit" ? cents : -cents;
-
-  const results = await env.DB.batch([
-    env.DB.prepare(`
-      UPDATE users
-      SET balance = balance + ?
-      WHERE id = ? AND balance + ? >= 0
-    `).bind(change, user.id, change),
-
-    env.DB.prepare(`
-      INSERT INTO balance_transactions
-      (user_id, amount_cents, type, description, admin_discord_id)
-      SELECT ?, ?, ?, ?, ?
-      WHERE changes() = 1
-    `).bind(
-      user.id,
-      change,
-      type,
-      reason,
-      actor.id
-    ),
-
-    env.DB.prepare(`
-      INSERT INTO admin_logs (admin_discord_id, action, details)
-      SELECT ?, ?, ?
-      WHERE changes() = 1
-    `).bind(
-      actor.id,
-      type,
-      `${discordId}: ${money(cents)} - ${reason}`
-    )
+  const update = await env.DB.prepare("UPDATE users SET balance = balance + ? WHERE id = ? AND balance + ? >= 0").bind(change, user.id, change).run();
+  if (!update.meta.changes) return "❌ Insufficient balance or transaction failed.";
+  await env.DB.batch([
+    env.DB.prepare("INSERT INTO balance_transactions (user_id, amount_cents, type, description, admin_discord_id) VALUES (?, ?, ?, ?, ?)").bind(user.id, change, type, reason, actorId),
+    env.DB.prepare("INSERT INTO admin_logs (admin_discord_id, action, details) VALUES (?, ?, ?)").bind(actorId, type, `${discordId}: ${money(cents)} - ${reason}`)
   ]);
-
-  if (!results[0].meta.changes) {
-    return "❌ Insufficient balance or transaction failed.";
-  }
-
   return `✅ ${type === "credit" ? "Added" : "Removed"} **${money(cents)}** ${type === "credit" ? "to" : "from"} <@${discordId}>.`;
 }
+
+async function historyCommand(interaction, env) {
+  const actorId = getInteractionUserId(interaction);
+  const discordId = getOption(interaction, "user") || actorId;
+  if (discordId !== actorId && !isStaff(interaction, env)) return "❌ Staff only.";
+  const user = await env.DB.prepare("SELECT id FROM users WHERE discord_id = ?").bind(discordId).first();
+  if (!user) return "❌ User not found.";
+  const { results } = await env.DB.prepare("SELECT amount_cents, type, description, created_at FROM balance_transactions WHERE user_id = ? ORDER BY id DESC LIMIT 10").bind(user.id).all();
+  if (!results.length) return "No transactions found.";
+  return `📜 **D4rk Transaction History**\n\n${results.map(t => `${t.amount_cents >= 0 ? "🟢" : "🔴"} **${money(Math.abs(t.amount_cents))}** — ${t.type}\n${safeText(t.description || "No description", 180)}`).join("\n\n")}`;
+}
+
+// ---------------- PRODUCT MANAGEMENT ----------------
+
+async function addProduct(interaction, env) {
+  if (!isStaff(interaction, env)) return "❌ Staff only.";
+  const name = safeText(getOption(interaction, "name"), 100);
+  const description = safeText(getOption(interaction, "description") || "No description provided.", 1000);
+  const image = getOption(interaction, "image") || null;
+  if (!name) return "❌ Product name is required.";
+  if (image && !/^https:\/\/\S+$/i.test(image)) return "❌ Image must be a valid HTTPS URL.";
+  const result = await env.DB.prepare("INSERT INTO products (name, description, image_url, active) VALUES (?, ?, ?, 1)").bind(name, description, image).run();
+  await env.DB.prepare("INSERT INTO admin_logs (admin_discord_id, action, details) VALUES (?, 'add_product', ?)").bind(getInteractionUserId(interaction), `Product #${result.meta.last_row_id}: ${name}`).run();
+  return `✅ Product **${name}** created with ID **${result.meta.last_row_id}**. Add a variant using \`/addvariant\`.`;
+}
+
+async function editProduct(interaction, env) {
+  if (!isStaff(interaction, env)) return "❌ Staff only.";
+  const id = getOption(interaction, "product_id");
+  const old = await env.DB.prepare("SELECT * FROM products WHERE id = ?").bind(id).first();
+  if (!old) return "❌ Product not found.";
+  const name = getOption(interaction, "name") ?? old.name;
+  const description = getOption(interaction, "description") ?? old.description;
+  const image = getOption(interaction, "image") ?? old.image_url;
+  if (image && !/^https:\/\/\S+$/i.test(image)) return "❌ Image must be a valid HTTPS URL.";
+  await env.DB.prepare("UPDATE products SET name = ?, description = ?, image_url = ? WHERE id = ?").bind(safeText(name, 100), safeText(description, 1000), image, id).run();
+  return `✅ Product **#${id}** updated.`;
+}
+
+async function deleteProduct(interaction, env) {
+  if (!isStaff(interaction, env)) return "❌ Staff only.";
+  const id = getOption(interaction, "product_id");
+  const result = await env.DB.batch([
+    env.DB.prepare("UPDATE products SET active = 0 WHERE id = ?").bind(id),
+    env.DB.prepare("UPDATE product_variants SET active = 0 WHERE product_id = ?").bind(id)
+  ]);
+  return result[0].meta.changes ? `✅ Product **#${id}** hidden from the shop (existing orders are preserved).` : "❌ Product not found.";
+}
+
+async function addVariant(interaction, env) {
+  if (!isStaff(interaction, env)) return "❌ Staff only.";
+  const productId = getOption(interaction, "product_id");
+  const name = safeText(getOption(interaction, "name"), 100);
+  const price = parseAmount(getOption(interaction, "price"));
+  const stock = getOption(interaction, "stock") ?? -1;
+  if (!Number.isInteger(productId) || !name || !price) return "❌ Invalid product, variant name or price.";
+  if (!Number.isInteger(stock) || stock < -1) return "❌ Stock must be -1 (unlimited) or zero and above.";
+  const product = await env.DB.prepare("SELECT id FROM products WHERE id = ? AND active = 1").bind(productId).first();
+  if (!product) return "❌ Active product not found.";
+  const result = await env.DB.prepare("INSERT INTO product_variants (product_id, name, price_cents, stock, active) VALUES (?, ?, ?, ?, 1)").bind(productId, name, price, stock).run();
+  return `✅ Variant **${name}** created. Variant ID: **${result.meta.last_row_id}** — ${money(price)}.`;
+}
+
+async function editVariant(interaction, env) {
+  if (!isStaff(interaction, env)) return "❌ Staff only.";
+  const id = getOption(interaction, "variant_id");
+  const old = await env.DB.prepare("SELECT * FROM product_variants WHERE id = ?").bind(id).first();
+  if (!old) return "❌ Variant not found.";
+  const name = getOption(interaction, "name") ?? old.name;
+  const priceInput = getOption(interaction, "price");
+  const stockInput = getOption(interaction, "stock");
+  const price = priceInput === undefined ? old.price_cents : parseAmount(priceInput);
+  const stock = stockInput === undefined ? old.stock : stockInput;
+  if (!price || !Number.isInteger(stock) || stock < -1) return "❌ Invalid price or stock.";
+  await env.DB.prepare("UPDATE product_variants SET name = ?, price_cents = ?, stock = ? WHERE id = ?").bind(safeText(name, 100), price, stock, id).run();
+  return `✅ Variant **#${id}** updated.`;
+}
+
+async function deleteVariant(interaction, env) {
+  if (!isStaff(interaction, env)) return "❌ Staff only.";
+  const id = getOption(interaction, "variant_id");
+  const result = await env.DB.prepare("UPDATE product_variants SET active = 0 WHERE id = ?").bind(id).run();
+  return result.meta.changes ? `✅ Variant **#${id}** disabled.` : "❌ Variant not found.";
+}
+
+async function productsCommand(interaction, env) {
+  if (!isStaff(interaction, env)) return "❌ Staff only.";
+  const { results } = await env.DB.prepare(`
+    SELECT p.id, p.name, p.active, v.id AS variant_id, v.name AS variant_name,
+           v.price_cents, v.stock, v.active AS variant_active
+    FROM products p LEFT JOIN product_variants v ON v.product_id = p.id
+    ORDER BY p.id DESC LIMIT 50
+  `).all();
+  if (!results.length) return "No products yet. Use `/addproduct`.";
+  return results.map(p => `**#${p.id} ${p.name}** ${p.active ? "🟢" : "⚫"}${p.variant_id ? `\n↳ Variant #${p.variant_id}: ${p.variant_name} — ${money(p.price_cents)} | Stock: ${p.stock === -1 ? "∞" : p.stock} | ${p.variant_active ? "Active" : "Disabled"}` : "\n↳ No variants"}`).join("\n\n").slice(0, 1900);
+}
+
+// ---------------- CUSTOMER SHOP ----------------
+
+async function showShop(interaction, env) {
+  const { results } = await env.DB.prepare(`
+    SELECT p.id, p.name, p.description, p.image_url,
+           MIN(v.price_cents) AS from_price, COUNT(v.id) AS variants
+    FROM products p JOIN product_variants v ON v.product_id = p.id
+    WHERE p.active = 1 AND v.active = 1 AND (v.stock = -1 OR v.stock > 0)
+    GROUP BY p.id ORDER BY p.id DESC LIMIT 25
+  `).all();
+  if (!results.length) return editOriginalResponse(interaction, { content: "The D4rk shop is currently empty.", embeds: [], components: [] });
+  const options = results.map(p => ({ label: safeText(p.name, 100), description: safeText(`${money(p.from_price)} • ${p.variants} option(s)`, 100), value: String(p.id) }));
+  const first = results[0];
+  const data = {
+    content: "Select a product below to view its available options.",
+    embeds: [{ ...embed("🛍️ D4rk Store", results.map(p => `**${p.name}** — from ${money(p.from_price)}`).join("\n"), 0x5865F2), ...(first.image_url ? { thumbnail: { url: first.image_url } } : {}) }],
+    components: [{ type: 1, components: [{ type: 3, custom_id: "shop_product", placeholder: "Choose a product", min_values: 1, max_values: 1, options }] }]
+  };
+  return editOriginalResponse(interaction, data);
+}
+
+async function showVariants(interaction, env, productId) {
+  const product = await env.DB.prepare("SELECT id, name, description, image_url FROM products WHERE id = ? AND active = 1").bind(productId).first();
+  if (!product) return editOriginalResponse(interaction, { content: "This product is no longer available.", embeds: [], components: [] });
+  const { results } = await env.DB.prepare("SELECT id, name, price_cents, stock FROM product_variants WHERE product_id = ? AND active = 1 AND (stock = -1 OR stock > 0) ORDER BY id LIMIT 25").bind(productId).all();
+  if (!results.length) return editOriginalResponse(interaction, { content: "No available options for this product.", embeds: [], components: [] });
+  const options = results.map(v => ({ label: safeText(v.name, 100), description: safeText(`${money(v.price_cents)} • Stock: ${v.stock === -1 ? "Unlimited" : v.stock}`, 100), value: String(v.id) }));
+  const em = { ...embed(product.name, product.description || "Choose an option below."), ...(product.image_url ? { image: { url: product.image_url } } : {}) };
+  return editOriginalResponse(interaction, {
+    content: "Choose your product option:",
+    embeds: [em],
+    components: [
+      { type: 1, components: [{ type: 3, custom_id: `shop_variant:${product.id}`, placeholder: "Choose an option", min_values: 1, max_values: 1, options }] },
+      { type: 1, components: [{ type: 2, style: 2, label: "Back to shop", custom_id: "shop_back" }] }
+    ]
+  });
+}
+
+async function showPaymentMethods(interaction, env, variantId) {
+  const variant = await env.DB.prepare(`
+    SELECT v.id, v.name, v.price_cents, v.stock, p.name AS product_name
+    FROM product_variants v JOIN products p ON p.id = v.product_id
+    WHERE v.id = ? AND v.active = 1 AND p.active = 1
+      AND (v.stock = -1 OR v.stock > 0)
+  `).bind(variantId).first();
+  if (!variant) return editOriginalResponse(interaction, { content: "This option is no longer available.", embeds: [], components: [] });
+  return editOriginalResponse(interaction, {
+    content: "Select how you would like to pay:",
+    embeds: [embed("Confirm your order", `**${variant.product_name} — ${variant.name}**\nTotal: **${money(variant.price_cents)}**\n\nChoose a payment method below.`)],
+    components: [
+      { type: 1, components: [{ type: 3, custom_id: `shop_payment:${variant.id}`, placeholder: "Payment method", min_values: 1, max_values: 1, options: [
+        { label: "Litecoin (LTC)", value: "ltc", description: "Pay with Litecoin" },
+        { label: "PayPal", value: "paypal", description: "Pay with PayPal" },
+        { label: "Bank transfer", value: "bank", description: "Pay by bank transfer" },
+        { label: "D4rk Balance", value: "balance", description: "Use your store balance" }
+      ] }] },
+      { type: 1, components: [{ type: 2, style: 2, label: "Back to shop", custom_id: "shop_back" }] }
+    ]
+  });
+}
+
+function paymentInstructions(method, env) {
+  if (method === "ltc") return env.LTC_ADDRESS ? `**Litecoin address:**\n\`${env.LTC_ADDRESS}\`` : "Contact D4rk staff for the Litecoin payment address.";
+  if (method === "paypal") return env.PAYPAL_DETAILS ? `**PayPal:**\n${env.PAYPAL_DETAILS}` : "Contact D4rk staff for PayPal payment instructions.";
+  if (method === "bank") {
+    const details = [env.BANK_HOLDER && `Account holder: ${env.BANK_HOLDER}`, env.BANK_IBAN && `IBAN: ${env.BANK_IBAN}`, env.BANK_BIC && `BIC: ${env.BANK_BIC}`].filter(Boolean);
+    return details.length ? `**Bank transfer details:**\n${details.join("\n")}` : "Contact D4rk staff for bank transfer details.";
+  }
+  return "Payment will be taken from your D4rk balance.";
+}
+
+async function createCustomerOrder(interaction, env, variantId, method) {
+  const discordId = getInteractionUserId(interaction);
+  const user = await env.DB.prepare("SELECT id, username, balance FROM users WHERE discord_id = ?").bind(discordId).first();
+  if (!user) return editOriginalResponse(interaction, { content: "Please log in to your D4rk account on the website before ordering.", embeds: [], components: [] });
+
+  const variant = await env.DB.prepare(`
+    SELECT v.id, v.product_id, v.name, v.price_cents, v.stock,
+           p.name AS product_name
+    FROM product_variants v JOIN products p ON p.id = v.product_id
+    WHERE v.id = ? AND v.active = 1 AND p.active = 1
+  `).bind(variantId).first();
+  if (!variant || (variant.stock !== -1 && variant.stock <= 0)) return editOriginalResponse(interaction, { content: "This option is out of stock or unavailable.", embeds: [], components: [] });
+
+  const orderNumber = `D4-${Date.now()}-${crypto.randomUUID().slice(0, 5).toUpperCase()}`;
+  let status = "pending_payment";
+
+  if (method === "balance") {
+    const debit = await env.DB.prepare("UPDATE users SET balance = balance - ? WHERE id = ? AND balance >= ?").bind(variant.price_cents, user.id, variant.price_cents).run();
+    if (!debit.meta.changes) return editOriginalResponse(interaction, { content: `Insufficient D4rk Balance. Your current balance is **${money(user.balance)}**.`, embeds: [], components: [] });
+    status = "paid";
+  }
+
+  const orderInsert = await env.DB.prepare(`
+    INSERT INTO orders (order_number, user_id, product_id, variant_id, payment_method, amount_cents, status)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).bind(orderNumber, user.id, variant.product_id, variant.id, method, variant.price_cents, status).run();
+  const orderId = orderInsert.meta.last_row_id;
+
+  await env.DB.prepare("INSERT INTO payments (order_id, method, amount_cents, status) VALUES (?, ?, ?, ?)").bind(orderId, method, variant.price_cents, status === "paid" ? "paid" : "pending").run();
+
+  if (method === "balance") {
+    await env.DB.prepare("INSERT INTO balance_transactions (user_id, amount_cents, type, description, order_id) VALUES (?, ?, 'purchase', ?, ?)").bind(user.id, -variant.price_cents, `Purchase: ${variant.product_name}`, orderId).run();
+  }
+
+  // Reserve one unit for pending or paid orders when stock is finite.
+  if (variant.stock > 0) {
+    const stockUpdate = await env.DB.prepare("UPDATE product_variants SET stock = stock - 1 WHERE id = ? AND stock > 0").bind(variant.id).run();
+    if (!stockUpdate.meta.changes) {
+      if (method === "balance") {
+        await env.DB.prepare("UPDATE users SET balance = balance + ? WHERE id = ?").bind(variant.price_cents, user.id).run();
+        await env.DB.prepare("INSERT INTO balance_transactions (user_id, amount_cents, type, description, order_id) VALUES (?, ?, 'refund', ?, ?)").bind(user.id, variant.price_cents, `Automatic stock rollback for ${orderNumber}`, orderId).run();
+      }
+      await env.DB.prepare("UPDATE orders SET status = 'cancelled' WHERE id = ?").bind(orderId).run();
+      return editOriginalResponse(interaction, { content: "Sorry, this option just went out of stock. No payment was taken.", embeds: [], components: [] });
+    }
+  }
+
+  const userObj = getInteractionUser(interaction);
+  const channelName = `order-${orderNumber.toLowerCase().replace(/[^a-z0-9-]/g, "").slice(-30)}`;
+  let channel;
+  try {
+    channel = await createPrivateChannel(env, interaction.guild_id, userObj, channelName, `D4rk order ${orderNumber} | ${discordId}`);
+    await env.DB.prepare("UPDATE orders SET discord_channel_id = ? WHERE id = ?").bind(channel.id, orderId).run();
+  } catch (error) {
+    console.error("Order channel creation failed:", error);
+    // Order remains recorded; staff can find it with database/admin tooling.
+  }
+
+  const paymentInfo = paymentInstructions(method, env);
+  const statusText = status === "paid" ? "Paid with D4rk Balance" : "Awaiting payment";
+  const orderEmbed = embed(`Order ${orderNumber}`, [
+    `**Customer:** <@${discordId}>`,
+    `**Product:** ${variant.product_name} — ${variant.name}`,
+    `**Total:** ${money(variant.price_cents)}`,
+    `**Payment:** ${method.toUpperCase()}`,
+    `**Status:** ${statusText}`,
+    "",
+    paymentInfo,
+    "",
+    "Once you have paid, send your payment proof in this ticket. Staff will verify it."
+  ].join("\n"), status === "paid" ? 0x57F287 : 0xFEE75C);
+
+  const components = isStaff(interaction, env) ? [] : [];
+  if (channel) {
+    await discordRequest(env, `/channels/${channel.id}/messages`, "POST", {
+      content: `<@${discordId}> ${env.STAFF_ROLE_ID ? `<@&${env.STAFF_ROLE_ID}>` : ""}`,
+      embeds: [orderEmbed],
+      components: [{
+        type: 1, components: [
+          { type: 2, style: 3, label: "Confirm payment", custom_id: `order_paid:${orderNumber}` },
+          { type: 2, style: 4, label: "Cancel order", custom_id: `order_cancel:${orderNumber}` }
+        ]
+      }]
+    });
+  }
+
+  await env.DB.prepare("INSERT INTO admin_logs (admin_discord_id, action, details) VALUES (?, 'customer_order', ?)").bind(discordId, `${orderNumber} - ${method}`).run();
+  return editOriginalResponse(interaction, {
+    content: `✅ Your order **${orderNumber}** has been created.${channel ? `\nYour private ticket: <#${channel.id}>` : "\nThe order was saved, but the ticket could not be created. Please contact staff."}`,
+    embeds: [embed("Order summary", `**${variant.product_name} — ${variant.name}**\n**Total:** ${money(variant.price_cents)}\n**Payment:** ${method.toUpperCase()}\n**Status:** ${statusText}`)],
+    components: []
+  });
+}
+
+// ---------------- STAFF ORDER ACTIONS ----------------
+
+async function orderAction(interaction, env, action, orderNumber) {
+  if (!isStaff(interaction, env)) {
+    return editOriginalResponse(interaction, "❌ Only D4rk staff can use these order controls.");
+  }
+  const order = await env.DB.prepare("SELECT id, user_id, amount_cents, status, variant_id, payment_method FROM orders WHERE order_number = ?").bind(orderNumber).first();
+  if (!order) return editOriginalResponse(interaction, "❌ Order not found.");
+
+  if (action === "paid") {
+    if (order.status !== "pending_payment") return editOriginalResponse(interaction, `❌ Order is currently **${order.status}**.`);
+    await env.DB.batch([
+      env.DB.prepare("UPDATE orders SET status = 'paid', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending_payment'").bind(order.id),
+      env.DB.prepare("UPDATE payments SET status = 'paid' WHERE order_id = ? AND status = 'pending'").bind(order.id),
+      env.DB.prepare("INSERT INTO admin_logs (admin_discord_id, action, details) VALUES (?, 'approve_order', ?)").bind(getInteractionUserId(interaction), orderNumber)
+    ]);
+    return editOriginalResponse(interaction, { content: `✅ Payment for **${orderNumber}** confirmed by <@${getInteractionUserId(interaction)}> .`, components: [] });
+  }
+
+  if (action === "cancel") {
+    if (!["pending_payment", "paid"].includes(order.status)) return editOriginalResponse(interaction, `❌ Order is currently **${order.status}**.`);
+    await env.DB.prepare("UPDATE orders SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = ?").bind(order.id, order.status).run();
+    await env.DB.prepare("UPDATE payments SET status = 'cancelled' WHERE order_id = ? AND status IN ('pending', 'paid')").bind(order.id).run();
+    if (order.variant_id) {
+      // Restore stock for a cancelled order.
+      await env.DB.prepare("UPDATE product_variants SET stock = stock + 1 WHERE id = ? AND stock >= 0").bind(order.variant_id).run();
+    }
+    if (order.payment_method === "balance" && order.status === "paid") {
+      await env.DB.prepare("UPDATE users SET balance = balance + ? WHERE id = ?").bind(order.amount_cents, order.user_id).run();
+      await env.DB.prepare("INSERT INTO balance_transactions (user_id, amount_cents, type, description, order_id, admin_discord_id) VALUES (?, ?, 'refund', ?, ?, ?)").bind(order.user_id, order.amount_cents, `Cancellation refund ${orderNumber}`, order.id, getInteractionUserId(interaction)).run();
+      await env.DB.prepare("UPDATE orders SET status = 'refunded' WHERE id = ?").bind(order.id).run();
+    }
+    await env.DB.prepare("INSERT INTO admin_logs (admin_discord_id, action, details) VALUES (?, 'cancel_order', ?)").bind(getInteractionUserId(interaction), orderNumber).run();
+    return editOriginalResponse(interaction, `🛑 Order **${orderNumber}** cancelled by staff.`);
+  }
+}
+
+async function createOrder(interaction, env) {
+  if (!isStaff(interaction, env)) return "❌ Staff only.";
+  const actorId = getInteractionUserId(interaction);
+  const discordId = getOption(interaction, "user");
+  const variantId = getOption(interaction, "variant_id");
+  const method = getOption(interaction, "payment_method");
+  if (!["ltc", "paypal", "bank", "balance"].includes(method)) return "❌ Invalid payment method.";
+  const variant = await env.DB.prepare("SELECT v.id, v.product_id, v.name, v.price_cents, p.name AS product_name FROM product_variants v JOIN products p ON p.id = v.product_id WHERE v.id = ? AND v.active = 1 AND p.active = 1").bind(variantId).first();
+  if (!variant) return "❌ Product variant not found.";
+  const user = await env.DB.prepare("SELECT id FROM users WHERE discord_id = ?").bind(discordId).first();
+  if (!user) return "❌ Customer account not found.";
+  // Staff-created orders use the same order path, but are created in the database directly.
+  const orderNumber = `D4-${Date.now()}-${crypto.randomUUID().slice(0, 5).toUpperCase()}`;
+  const status = method === "balance" ? "paid" : "pending_payment";
+  if (method === "balance") {
+    const debit = await env.DB.prepare("UPDATE users SET balance = balance - ? WHERE id = ? AND balance >= ?").bind(variant.price_cents, user.id, variant.price_cents).run();
+    if (!debit.meta.changes) return "❌ Insufficient customer balance.";
+  }
+  const inserted = await env.DB.prepare("INSERT INTO orders (order_number, user_id, product_id, variant_id, payment_method, amount_cents, status) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(orderNumber, user.id, variant.product_id, variant.id, method, variant.price_cents, status).run();
+  await env.DB.prepare("INSERT INTO payments (order_id, method, amount_cents, status) VALUES (?, ?, ?, ?)").bind(inserted.meta.last_row_id, method, variant.price_cents, status === "paid" ? "paid" : "pending").run();
+  if (method === "balance") await env.DB.prepare("INSERT INTO balance_transactions (user_id, amount_cents, type, description, order_id, admin_discord_id) VALUES (?, ?, 'purchase', ?, ?, ?)").bind(user.id, -variant.price_cents, `Purchase: ${variant.product_name}`, inserted.meta.last_row_id, actorId).run();
+  await env.DB.prepare("INSERT INTO admin_logs (admin_discord_id, action, details) VALUES (?, 'create_order', ?)").bind(actorId, `${orderNumber} - ${discordId} - ${method}`).run();
+  return `✅ **Order created: ${orderNumber}**\nCustomer: <@${discordId}>\nProduct: ${variant.product_name} — ${variant.name}\nAmount: ${money(variant.price_cents)}\nPayment: ${method}\nStatus: ${status}`;
+}
+
+async function approveOrder(interaction, env) {
+  if (!isStaff(interaction, env)) return "❌ Staff only.";
+  const orderNumber = getOption(interaction, "order");
+  const order = await env.DB.prepare("SELECT id, status FROM orders WHERE order_number = ?").bind(orderNumber).first();
+  if (!order || order.status !== "pending_payment") return "❌ Order not found, already paid or not awaiting payment.";
+  await env.DB.batch([
+    env.DB.prepare("UPDATE orders SET status = 'paid', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending_payment'").bind(order.id),
+    env.DB.prepare("UPDATE payments SET status = 'paid' WHERE order_id = ? AND status = 'pending'").bind(order.id),
+    env.DB.prepare("INSERT INTO admin_logs (admin_discord_id, action, details) VALUES (?, 'approve_order', ?)").bind(getInteractionUserId(interaction), orderNumber)
+  ]);
+  return `✅ Order **${orderNumber}** marked as paid.`;
+}
+
+async function refundOrder(interaction, env) {
+  if (!isStaff(interaction, env)) return "❌ Staff only.";
+  const orderNumber = getOption(interaction, "order");
+  const order = await env.DB.prepare("SELECT id, user_id, amount_cents, status FROM orders WHERE order_number = ?").bind(orderNumber).first();
+  if (!order || order.status !== "paid") return "❌ Order not found or already refunded.";
+  const updated = await env.DB.prepare("UPDATE orders SET status = 'refunded', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'paid'").bind(order.id).run();
+  if (!updated.meta.changes) return "❌ Refund already processed.";
+  await env.DB.prepare("UPDATE users SET balance = balance + ? WHERE id = ?").bind(order.amount_cents, order.user_id).run();
+  await env.DB.prepare("INSERT INTO balance_transactions (user_id, amount_cents, type, description, order_id, admin_discord_id) VALUES (?, ?, 'refund', ?, ?, ?)").bind(order.user_id, order.amount_cents, `Refund for ${orderNumber}`, order.id, getInteractionUserId(interaction)).run();
+  await env.DB.prepare("UPDATE payments SET status = 'refunded' WHERE order_id = ?").bind(order.id).run();
+  return `✅ **${orderNumber} refunded.**\n${money(order.amount_cents)} credited to the customer's D4rk balance.`;
+}
+
+// ---------------- INTERACTION ROUTING ----------------
+
+async function handleCommand(interaction, env) {
+  switch (interaction.data.name) {
+    case "balance": return balanceCommand(interaction, env);
+    case "addbalance": return changeBalance(interaction, env, "credit");
+    case "removebalance": return changeBalance(interaction, env, "debit");
+    case "history": return historyCommand(interaction, env);
+    case "createorder": return createOrder(interaction, env);
+    case "approveorder": return approveOrder(interaction, env);
+    case "refund": return refundOrder(interaction, env);
+    case "shop": return showShop(interaction, env);
+    case "addproduct": return addProduct(interaction, env);
+    case "editproduct": return editProduct(interaction, env);
+    case "deleteproduct": return deleteProduct(interaction, env);
+    case "addvariant": return addVariant(interaction, env);
+    case "editvariant": return editVariant(interaction, env);
+    case "deletevariant": return deleteVariant(interaction, env);
+    case "products": return productsCommand(interaction, env);
+    default: return "Unknown command.";
+  }
+}
+
+async function handleComponent(interaction, env) {
+  const id = interaction.data.custom_id || "";
+  const values = interaction.data.values || [];
+  if (id === "shop_back") return showShop(interaction, env);
+  if (id === "shop_product") return showVariants(interaction, env, Number(values[0]));
+  if (id.startsWith("shop_variant:")) return showPaymentMethods(interaction, env, Number(values[0]));
+  if (id.startsWith("shop_payment:")) {
+    const method = values[0];
+    if (!["ltc", "paypal", "bank", "balance"].includes(method)) return editOriginalResponse(interaction, "Invalid payment method.");
+    return createCustomerOrder(interaction, env, Number(id.split(":")[1]), method);
+  }
+  if (id.startsWith("order_paid:")) return orderAction(interaction, env, "paid", id.slice("order_paid:".length));
+  if (id.startsWith("order_cancel:")) return orderAction(interaction, env, "cancel", id.slice("order_cancel:".length));
+  return editOriginalResponse(interaction, "Unsupported action.");
+}
+
+// ---------------- OAUTH ----------------
+
+async function oauthLogin(request, env) {
+  const url = new URL(request.url);
+  const state = randomToken();
+  await env.DB.prepare("INSERT INTO oauth_states (state, expires_at) VALUES (?, ?)").bind(state, Math.floor(Date.now() / 1000) + OAUTH_STATE_DURATION).run();
+  const redirectUri = `${url.origin}/auth/callback`;
+  const params = new URLSearchParams({ client_id: env.APPLICATION_ID, redirect_uri: redirectUri, response_type: "code", scope: "identify", state });
+  return Response.redirect(`https://discord.com/oauth2/authorize?${params.toString()}`, 302);
+}
+
+async function oauthCallback(request, env) {
+  const url = new URL(request.url);
+  const code = url.searchParams.get("code");
+  const state = url.searchParams.get("state");
+  if (!code || !state) return new Response("Invalid OAuth request.", { status: 400 });
+  const savedState = await env.DB.prepare("SELECT state FROM oauth_states WHERE state = ? AND expires_at > ?").bind(state, Math.floor(Date.now() / 1000)).first();
+  if (!savedState) return new Response("Invalid or expired OAuth state.", { status: 400 });
+  await env.DB.prepare("DELETE FROM oauth_states WHERE state = ?").bind(state).run();
+  const redirectUri = `${url.origin}/auth/callback`;
+  const tokenResponse = await fetch(`${DISCORD_API}/oauth2/token`, {
+    method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ client_id: env.APPLICATION_ID, client_secret: env.DISCORD_CLIENT_SECRET, grant_type: "authorization_code", code, redirect_uri: redirectUri })
+  });
+  const tokens = await tokenResponse.json();
+  if (!tokenResponse.ok || !tokens.access_token) return new Response("Discord authentication failed.", { status: 401 });
+  const userResponse = await fetch(`${DISCORD_API}/users/@me`, { headers: { Authorization: `Bearer ${tokens.access_token}` } });
+  const discordUser = await userResponse.json();
+  if (!userResponse.ok || !discordUser.id) return new Response("Could not retrieve Discord account.", { status: 401 });
+  await env.DB.prepare("INSERT INTO users (discord_id, username) VALUES (?, ?) ON CONFLICT(discord_id) DO UPDATE SET username = excluded.username").bind(discordUser.id, discordUser.username).run();
+  const databaseUser = await env.DB.prepare("SELECT id FROM users WHERE discord_id = ?").bind(discordUser.id).first();
+  const sessionToken = randomToken();
+  await env.DB.prepare("INSERT INTO sessions (user_id, token_hash, expires_at) VALUES (?, ?, ?)").bind(databaseUser.id, await hash(sessionToken), Math.floor(Date.now() / 1000) + SESSION_DURATION).run();
+  return new Response(null, { status: 302, headers: { Location: "/", "Set-Cookie": sessionCookie(sessionToken) } });
+}
+
+async function getCurrentUser(request, env) {
+  const token = getCookie(request, "d4rk_session");
+  if (!token) return null;
+  return env.DB.prepare(`
+    SELECT users.id, users.discord_id, users.username, users.balance
+    FROM sessions JOIN users ON users.id = sessions.user_id
+    WHERE sessions.token_hash = ? AND sessions.expires_at > ?
+  `).bind(await hash(token), Math.floor(Date.now() / 1000)).first();
+}
+
+async function logout(request, env) {
+  const token = getCookie(request, "d4rk_session");
+  if (token) await env.DB.prepare("DELETE FROM sessions WHERE token_hash = ?").bind(await hash(token)).run();
+  return new Response(null, { status: 302, headers: { Location: "/", "Set-Cookie": sessionCookie("", 0) } });
+}
+
+// ---------------- SLASH COMMAND DEFINITIONS ----------------
+
+function commandDefinitions() {
+  const opt = (name, description, type, required = false, extra = {}) => ({ name, description, type, required, ...extra });
+  return [
+    { name: "ticket", description: "Open a D4rk support ticket", type: 1 },
+    { name: "shop", description: "Browse the D4rk product catalogue", type: 1 },
+    { name: "balance", description: "Check your D4rk balance", type: 1 },
+    { name: "products", description: "List products and variants (staff)", type: 1 },
+    { name: "addproduct", description: "Add a product (staff)", type: 1, options: [
+      opt("name", "Product name", 3, true), opt("description", "Product description", 3), opt("image", "HTTPS image URL", 3)
+    ]},
+    { name: "editproduct", description: "Edit a product (staff)", type: 1, options: [
+      opt("product_id", "Product ID", 4, true), opt("name", "New product name", 3), opt("description", "New description", 3), opt("image", "New HTTPS image URL", 3)
+    ]},
+    { name: "deleteproduct", description: "Hide a product (staff)", type: 1, options: [opt("product_id", "Product ID", 4, true)] },
+    { name: "addvariant", description: "Add a product option or price (staff)", type: 1, options: [
+      opt("product_id", "Parent product ID", 4, true), opt("name", "Variant name", 3, true), opt("price", "Price in euros", 10, true), opt("stock", "Stock (-1 for unlimited)", 4)
+    ]},
+    { name: "editvariant", description: "Edit a product option (staff)", type: 1, options: [
+      opt("variant_id", "Variant ID", 4, true), opt("name", "New variant name", 3), opt("price", "New price in euros", 10), opt("stock", "New stock (-1 for unlimited)", 4)
+    ]},
+    { name: "deletevariant", description: "Disable a product option (staff)", type: 1, options: [opt("variant_id", "Variant ID", 4, true)] },
+    { name: "addbalance", description: "Add money to a customer (staff)", type: 1, options: [
+      opt("user", "Customer Discord ID", 3, true), opt("amount", "Amount in euros", 10, true), opt("reason", "Reason", 3)
+    ]},
+    { name: "removebalance", description: "Remove money from a customer (staff)", type: 1, options: [
+      opt("user", "Customer Discord ID", 3, true), opt("amount", "Amount in euros", 10, true), opt("reason", "Reason", 3)
+    ]},
+    { name: "history", description: "View transaction history", type: 1, options: [opt("user", "Customer Discord ID (staff only)", 3)] },
+    { name: "createorder", description: "Create a customer order (staff)", type: 1, options: [
+      opt("user", "Customer Discord ID", 3, true), opt("variant_id", "Product variant ID", 4, true),
+      opt("payment_method", "Payment method", 3, true, { choices: [
+        { name: "Litecoin", value: "ltc" }, { name: "PayPal", value: "paypal" }, { name: "Bank transfer", value: "bank" }, { name: "D4rk Balance", value: "balance" }
+      ]})
+    ]},
+    { name: "approveorder", description: "Approve a customer payment (staff)", type: 1, options: [opt("order", "Order number", 3, true)] },
+    { name: "refund", description: "Refund a paid order to customer balance (staff)", type: 1, options: [opt("order", "Order number", 3, true)] }
+  ];
+}
+
+// ---------------- WORKER ----------------
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    try {
+      if (url.pathname === "/auth/login" && request.method === "GET") return await oauthLogin(request, env);
+      if (url.pathname === "/auth/callback" && request.method === "GET") return await oauthCallback(request, env);
+      if (url.pathname === "/auth/logout" && request.method === "POST") return await logout(request, env);
+
+      if (url.pathname === "/api/me" && request.method === "GET") {
+        const user = await getCurrentUser(request, env);
+        if (!user) return json({ authenticated: false });
+        return json({ authenticated: true, user: { id: user.id, discord_id: user.discord_id, username: user.username, balance: user.balance } });
+      }
+
+      if (url.pathname === "/register" && request.method === "GET") {
+        if (!env.REGISTER_SECRET || url.searchParams.get("key") !== env.REGISTER_SECRET) return new Response("Unauthorized", { status: 401 });
+        const response = await fetch(`${DISCORD_API}/applications/${env.APPLICATION_ID}/guilds/${env.GUILD_ID}/commands`, {
+          method: "PUT",
+          headers: { Authorization: `Bot ${env.DISCORD_TOKEN}`, "Content-Type": "application/json" },
+          body: JSON.stringify(commandDefinitions())
+        });
+        return new Response(await response.text(), { status: response.status });
+      }
+
+      if (request.method === "POST" && request.headers.has("X-Signature-Ed25519")) {
+        const body = await request.text();
+        if (!await verifySignature(request, body, env.PUBLIC_KEY)) return new Response("Invalid signature", { status: 401 });
+        const interaction = JSON.parse(body);
+        if (interaction.type === 1) return json({ type: 1 });
+
+        if (interaction.type === 2) {
+          const name = interaction.data.name;
+          if (name === "shop") {
+            const response = json({ type: 5, data: { flags: 64 } });
+            ctx.waitUntil((async () => {
+              try { await showShop(interaction, env); }
+              catch (error) { console.error("Shop error:", error); await editOriginalResponse(interaction, "❌ Could not load the shop. Please contact staff."); }
+            })());
+            return response;
+          }
+          const response = json({ type: 5, data: { flags: 64 } });
+          ctx.waitUntil((async () => {
+            try {
+              let result;
+              if (name === "ticket") {
+                const channel = await createTicket(interaction, env);
+                result = `🎫 Your ticket has been created: <#${channel.id}>`;
+              } else result = await handleCommand(interaction, env);
+              if (typeof result === "string") await editOriginalResponse(interaction, result);
+            } catch (error) {
+              console.error("Command failed:", error);
+              await editOriginalResponse(interaction, "❌ An error occurred. Please contact D4rk staff.");
+            }
+          })());
+          return response;
+        }
+
+        if (interaction.type === 3) {
+          const response = json({ type: 6 });
+          ctx.waitUntil((async () => {
+            try { await handleComponent(interaction, env); }
+            catch (error) {
+              console.error("Component failed:", error);
+              await editOriginalResponse(interaction, "❌ Something went wrong. Please contact D4rk staff.");
+            }
+          })());
+          return response;
+        }
+
+        return json(ephemeral("Unsupported interaction."));
+      }
+
+      if (url.pathname === "/health") return json({ status: "online", project: "D4rk" });
+      if (env.ASSETS) return env.ASSETS.fetch(request);
+      return new Response("D4rk is online!", { status: 200 });
+    } catch (error) {
+      console.error("D4rk backend error:", error);
+      return json({ error: "An internal server error occurred." }, 500);
+    }
+  }
+};
