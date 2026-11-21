@@ -53,7 +53,7 @@ function parseAmount(value) {
   return cents <= 0 || cents > 100000000 ? null : cents;
 }
 function safeText(value, max = 100) {
-  return String(value || "").replace(/[\r\n]/g, " ").slice(0, max);
+  return String(value || "").replace(/[\r\n]/g, " ").replace(/@/g, "@\u200b").slice(0, max);
 }
 function ephemeral(content, extra = {}) {
   return { type: 4, data: { content, flags: 64, ...extra } };
@@ -245,7 +245,7 @@ async function productsCommand(interaction, env) {
 
 // ---------------- CUSTOMER SHOP ----------------
 
-async function showShop(interaction, env) {
+async function buildShopPayload(env) {
   const { results } = await env.DB.prepare(`
     SELECT p.id, p.name, p.description, p.image_url,
            MIN(v.price_cents) AS from_price, COUNT(v.id) AS variants
@@ -253,195 +253,220 @@ async function showShop(interaction, env) {
     WHERE p.active = 1 AND v.active = 1 AND (v.stock = -1 OR v.stock > 0)
     GROUP BY p.id ORDER BY p.id DESC LIMIT 25
   `).all();
-  if (!results.length) return editOriginalResponse(interaction, { content: "The D4rk shop is currently empty.", embeds: [], components: [] });
+  if (!results.length) return { content: 'The D4rk shop is currently empty.', embeds: [], components: [] };
   const options = results.map(p => ({ label: safeText(p.name, 100), description: safeText(`${money(p.from_price)} • ${p.variants} option(s)`, 100), value: String(p.id) }));
-  const first = results[0];
-  const data = {
-    content: "Select a product below to view its available options.",
-    embeds: [{ ...embed("🛍️ D4rk Store", results.map(p => `**${p.name}** — from ${money(p.from_price)}`).join("\n"), 0x5865F2), ...(first.image_url ? { thumbnail: { url: first.image_url } } : {}) }],
-    components: [{ type: 1, components: [{ type: 3, custom_id: "shop_product", placeholder: "Choose a product", min_values: 1, max_values: 1, options }] }]
+  const description = results.map(p => `**${safeText(p.name, 100)}** — from **${money(p.from_price)}**`).join('\n');
+  return {
+    content: '🛍️ **Welcome to the D4rk Store!**\nBrowse our products below. Your selections and payment instructions will be visible only to you.',
+    embeds: [embed('D4rk • Product catalogue', description, 0x5865F2)],
+    components: [{ type: 1, components: [{ type: 3, custom_id: 'shop_product', placeholder: 'Select a product', min_values: 1, max_values: 1, options }] }]
   };
-  return editOriginalResponse(interaction, data);
+}
+
+async function publishShop(interaction, env) {
+  if (!isStaff(interaction, env)) return "❌ Only D4rk staff can publish or refresh the public shop catalogue.";
+
+  const channelId = interaction.channel_id;
+  if (!channelId) return "❌ Run /shop inside the shop channel on your server.";
+
+  const payload = await buildShopPayload(env);
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS shop_posts (
+    guild_id TEXT PRIMARY KEY,
+    channel_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`).run();
+
+  const existing = await env.DB.prepare("SELECT channel_id, message_id FROM shop_posts WHERE guild_id = ?")
+    .bind(interaction.guild_id || env.GUILD_ID).first();
+
+  if (existing) {
+    try {
+      await discordRequest(env, `/channels/${existing.channel_id}/messages/${existing.message_id}`, "PATCH", payload);
+      return `✅ The public D4rk catalogue has been refreshed: <#${existing.channel_id}>. Customers' selections and payment steps remain private.`;
+    } catch (error) {
+      console.error("Could not refresh the previous shop message; publishing a replacement:", error);
+    }
+  }
+
+  const message = await discordRequest(env, `/channels/${channelId}/messages`, "POST", payload);
+  await env.DB.prepare(`INSERT INTO shop_posts (guild_id, channel_id, message_id, updated_at)
+    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(guild_id) DO UPDATE SET channel_id = excluded.channel_id, message_id = excluded.message_id, updated_at = CURRENT_TIMESTAMP`)
+    .bind(interaction.guild_id || env.GUILD_ID, channelId, message.id).run();
+
+  return `✅ The public D4rk catalogue is now posted in <#${channelId}>. You only need to run /shop once; running it again will refresh that same message. Customer selections, variants and payment instructions are private.`;
+}
+
+async function showShop(interaction, env) {
+  // Used only for the private "Back to catalogue" navigation after a customer has interacted.
+  return editOriginalResponse(interaction, await buildShopPayload(env));
 }
 
 async function showVariants(interaction, env, productId) {
-  const product = await env.DB.prepare("SELECT id, name, description, image_url FROM products WHERE id = ? AND active = 1").bind(productId).first();
-  if (!product) return editOriginalResponse(interaction, { content: "This product is no longer available.", embeds: [], components: [] });
-  const { results } = await env.DB.prepare("SELECT id, name, price_cents, stock FROM product_variants WHERE product_id = ? AND active = 1 AND (stock = -1 OR stock > 0) ORDER BY id LIMIT 25").bind(productId).all();
-  if (!results.length) return editOriginalResponse(interaction, { content: "No available options for this product.", embeds: [], components: [] });
-  const options = results.map(v => ({ label: safeText(v.name, 100), description: safeText(`${money(v.price_cents)} • Stock: ${v.stock === -1 ? "Unlimited" : v.stock}`, 100), value: String(v.id) }));
-  const em = { ...embed(product.name, product.description || "Choose an option below."), ...(product.image_url ? { image: { url: product.image_url } } : {}) };
-  return editOriginalResponse(interaction, {
-    content: "Choose your product option:",
-    embeds: [em],
-    components: [
-      { type: 1, components: [{ type: 3, custom_id: `shop_variant:${product.id}`, placeholder: "Choose an option", min_values: 1, max_values: 1, options }] },
-      { type: 1, components: [{ type: 2, style: 2, label: "Back to shop", custom_id: "shop_back" }] }
-    ]
-  });
+  const product = await env.DB.prepare('SELECT id, name, description, image_url FROM products WHERE id = ? AND active = 1').bind(productId).first();
+  if (!product) return editOriginalResponse(interaction, { content: 'This product is no longer available.', embeds: [], components: [] });
+  const { results } = await env.DB.prepare('SELECT id, name, price_cents, stock FROM product_variants WHERE product_id = ? AND active = 1 AND (stock = -1 OR stock > 0) ORDER BY id LIMIT 25').bind(productId).all();
+  if (!results.length) return editOriginalResponse(interaction, { content: 'No available options for this product.', embeds: [], components: [] });
+  const options = results.map(v => ({ label: safeText(v.name, 100), description: safeText(`${money(v.price_cents)} • Stock: ${v.stock === -1 ? 'Unlimited' : v.stock}`, 100), value: String(v.id) }));
+  const em = { ...embed(product.name, product.description || 'Choose an option below.'), ...(product.image_url ? { image: { url: product.image_url } } : {}) };
+  return editOriginalResponse(interaction, { content: 'Choose your option (this menu is private):', embeds: [em], components: [
+    { type: 1, components: [{ type: 3, custom_id: `shop_variant:${product.id}`, placeholder: 'Choose an option', min_values: 1, max_values: 1, options }] },
+    { type: 1, components: [{ type: 2, style: 2, label: 'Back to catalogue', custom_id: 'shop_back' }] }
+  ] });
 }
 
 async function showPaymentMethods(interaction, env, variantId) {
-  const variant = await env.DB.prepare(`
-    SELECT v.id, v.name, v.price_cents, v.stock, p.name AS product_name
-    FROM product_variants v JOIN products p ON p.id = v.product_id
-    WHERE v.id = ? AND v.active = 1 AND p.active = 1
-      AND (v.stock = -1 OR v.stock > 0)
-  `).bind(variantId).first();
-  if (!variant) return editOriginalResponse(interaction, { content: "This option is no longer available.", embeds: [], components: [] });
+  const variant = await env.DB.prepare(`SELECT v.id, v.name, v.price_cents, v.stock, p.name AS product_name FROM product_variants v JOIN products p ON p.id = v.product_id WHERE v.id = ? AND v.active = 1 AND p.active = 1 AND (v.stock = -1 OR v.stock > 0)`).bind(variantId).first();
+  if (!variant) return editOriginalResponse(interaction, { content: 'This option is no longer available.', embeds: [], components: [] });
   return editOriginalResponse(interaction, {
-    content: "Select how you would like to pay:",
-    embeds: [embed("Confirm your order", `**${variant.product_name} — ${variant.name}**\nTotal: **${money(variant.price_cents)}**\n\nChoose a payment method below.`)],
+    content: 'Choose your payment method. The payment details will be shown privately to you.',
+    embeds: [embed('Order selection', `**${variant.product_name} — ${variant.name}**\nTotal: **${money(variant.price_cents)}**`) ],
     components: [
-      { type: 1, components: [{ type: 3, custom_id: `shop_payment:${variant.id}`, placeholder: "Payment method", min_values: 1, max_values: 1, options: [
-        { label: "Litecoin (LTC)", value: "ltc", description: "Pay with Litecoin" },
-        { label: "PayPal", value: "paypal", description: "Pay with PayPal" },
-        { label: "Bank transfer", value: "bank", description: "Pay by bank transfer" },
-        { label: "D4rk Balance", value: "balance", description: "Use your store balance" }
+      { type: 1, components: [{ type: 3, custom_id: `shop_payment:${variant.id}`, placeholder: 'Select payment method', min_values: 1, max_values: 1, options: [
+        { label: 'Litecoin (LTC)', value: 'ltc', description: 'Pay with Litecoin' },
+        { label: 'PayPal', value: 'paypal', description: 'Pay with PayPal' },
+        { label: 'Bank transfer', value: 'bank', description: 'Pay by bank transfer' },
+        { label: 'D4rk Balance', value: 'balance', description: 'Use your D4rk balance' }
       ] }] },
-      { type: 1, components: [{ type: 2, style: 2, label: "Back to shop", custom_id: "shop_back" }] }
+      { type: 1, components: [{ type: 2, style: 2, label: 'Back to catalogue', custom_id: 'shop_back' }] }
     ]
   });
 }
 
 function paymentInstructions(method, env) {
-  if (method === "ltc") return env.LTC_ADDRESS ? `**Litecoin address:**\n\`${env.LTC_ADDRESS}\`` : "Contact D4rk staff for the Litecoin payment address.";
-  if (method === "paypal") return env.PAYPAL_DETAILS ? `**PayPal:**\n${env.PAYPAL_DETAILS}` : "Contact D4rk staff for PayPal payment instructions.";
-  if (method === "bank") {
-    const details = [env.BANK_HOLDER && `Account holder: ${env.BANK_HOLDER}`, env.BANK_IBAN && `IBAN: ${env.BANK_IBAN}`, env.BANK_BIC && `BIC: ${env.BANK_BIC}`].filter(Boolean);
-    return details.length ? `**Bank transfer details:**\n${details.join("\n")}` : "Contact D4rk staff for bank transfer details.";
+  if (method === 'ltc') return env.LTC_ADDRESS ? `**Litecoin address:**\n\`${env.LTC_ADDRESS}\`` : 'Payment address is not configured. Please contact D4rk staff.';
+  if (method === 'paypal') return env.PAYPAL_DETAILS ? `**PayPal:**\n${safeText(env.PAYPAL_DETAILS, 500)}` : 'PayPal details are not configured. Please contact D4rk staff.';
+  if (method === 'bank') {
+    const details = [env.BANK_HOLDER && `Account holder: ${safeText(env.BANK_HOLDER, 100)}`, env.BANK_IBAN && `IBAN: ${safeText(env.BANK_IBAN, 60)}`, env.BANK_BIC && `BIC: ${safeText(env.BANK_BIC, 30)}`].filter(Boolean);
+    return details.length ? `**Bank transfer details:**\n${details.join('\n')}` : 'Bank details are not configured. Please contact D4rk staff.';
   }
-  return "Payment will be taken from your D4rk balance.";
+  return 'The amount will be deducted from your D4rk balance.';
+}
+
+async function createOrderReviewMessage(env, order, userId, productName, variantName) {
+  if (!env.STAFF_CHANNEL_ID) return false;
+  await discordRequest(env, `/channels/${env.STAFF_CHANNEL_ID}/messages`, 'POST', {
+    content: env.STAFF_ROLE_ID ? `<@&${env.STAFF_ROLE_ID}>` : 'D4rk staff — payment review required.',
+    embeds: [embed(`Payment submitted • ${order.order_number}`, `**Customer:** <@${userId}>\n**Product:** ${productName} — ${variantName}\n**Amount:** ${money(order.amount_cents)}\n**Method:** ${order.payment_method.toUpperCase()}\n**Status:** Awaiting staff verification`, 0xFEE75C)],
+    components: [{ type: 1, components: [
+      { type: 2, style: 3, label: 'Confirm payment & open ticket', custom_id: `order_verify:${order.order_number}` },
+      { type: 2, style: 4, label: 'Reject payment', custom_id: `order_reject:${order.order_number}` }
+    ] }]
+  });
+  return true;
+}
+
+async function openPaidOrderTicket(env, guildId, order, userDiscordId, productName, variantName) {
+  const userObj = { id: userDiscordId };
+  const channelName = `order-${order.order_number.toLowerCase().replace(/[^a-z0-9-]/g, '').slice(-30)}`;
+  const channel = await createPrivateChannel(env, guildId || env.GUILD_ID, userObj, channelName, `D4rk order ${order.order_number} | ${userDiscordId}`);
+  await env.DB.prepare('UPDATE orders SET discord_channel_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').bind(channel.id, order.id).run();
+  await discordRequest(env, `/channels/${channel.id}/messages`, 'POST', {
+    content: `<@${userDiscordId}> ${env.STAFF_ROLE_ID ? `<@&${env.STAFF_ROLE_ID}>` : ''}`,
+    embeds: [embed(`✅ Paid order ${order.order_number}`, `**Customer:** <@${userDiscordId}>\n**Product:** ${productName} — ${variantName}\n**Total:** ${money(order.amount_cents)}\n**Payment:** ${order.payment_method.toUpperCase()}\n**Status:** Payment verified. Staff can now process the order.`, 0x57F287)]
+  });
+  return channel;
 }
 
 async function createCustomerOrder(interaction, env, variantId, method) {
   const discordId = getInteractionUserId(interaction);
-  const user = await env.DB.prepare("SELECT id, username, balance FROM users WHERE discord_id = ?").bind(discordId).first();
-  if (!user) return editOriginalResponse(interaction, { content: "Please log in to your D4rk account on the website before ordering.", embeds: [], components: [] });
-
-  const variant = await env.DB.prepare(`
-    SELECT v.id, v.product_id, v.name, v.price_cents, v.stock,
-           p.name AS product_name
-    FROM product_variants v JOIN products p ON p.id = v.product_id
-    WHERE v.id = ? AND v.active = 1 AND p.active = 1
-  `).bind(variantId).first();
-  if (!variant || (variant.stock !== -1 && variant.stock <= 0)) return editOriginalResponse(interaction, { content: "This option is out of stock or unavailable.", embeds: [], components: [] });
+  const user = await env.DB.prepare('SELECT id, username, balance FROM users WHERE discord_id = ?').bind(discordId).first();
+  if (!user) return editOriginalResponse(interaction, { content: 'Please log in to your D4rk account on the website before ordering.', embeds: [], components: [] });
+  const variant = await env.DB.prepare(`SELECT v.id, v.product_id, v.name, v.price_cents, v.stock, p.name AS product_name FROM product_variants v JOIN products p ON p.id = v.product_id WHERE v.id = ? AND v.active = 1 AND p.active = 1`).bind(variantId).first();
+  if (!variant || (variant.stock !== -1 && variant.stock <= 0)) return editOriginalResponse(interaction, { content: 'This option is out of stock or unavailable.', embeds: [], components: [] });
 
   const orderNumber = `D4-${Date.now()}-${crypto.randomUUID().slice(0, 5).toUpperCase()}`;
-  let status = "pending_payment";
-
-  if (method === "balance") {
-    const debit = await env.DB.prepare("UPDATE users SET balance = balance - ? WHERE id = ? AND balance >= ?").bind(variant.price_cents, user.id, variant.price_cents).run();
+  if (method === 'balance') {
+    const debit = await env.DB.prepare('UPDATE users SET balance = balance - ? WHERE id = ? AND balance >= ?').bind(variant.price_cents, user.id, variant.price_cents).run();
     if (!debit.meta.changes) return editOriginalResponse(interaction, { content: `Insufficient D4rk Balance. Your current balance is **${money(user.balance)}**.`, embeds: [], components: [] });
-    status = "paid";
   }
-
-  const orderInsert = await env.DB.prepare(`
-    INSERT INTO orders (order_number, user_id, product_id, variant_id, payment_method, amount_cents, status)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).bind(orderNumber, user.id, variant.product_id, variant.id, method, variant.price_cents, status).run();
-  const orderId = orderInsert.meta.last_row_id;
-
-  await env.DB.prepare("INSERT INTO payments (order_id, method, amount_cents, status) VALUES (?, ?, ?, ?)").bind(orderId, method, variant.price_cents, status === "paid" ? "paid" : "pending").run();
-
-  if (method === "balance") {
-    await env.DB.prepare("INSERT INTO balance_transactions (user_id, amount_cents, type, description, order_id) VALUES (?, ?, 'purchase', ?, ?)").bind(user.id, -variant.price_cents, `Purchase: ${variant.product_name}`, orderId).run();
-  }
-
-  // Reserve one unit for pending or paid orders when stock is finite.
   if (variant.stock > 0) {
-    const stockUpdate = await env.DB.prepare("UPDATE product_variants SET stock = stock - 1 WHERE id = ? AND stock > 0").bind(variant.id).run();
+    const stockUpdate = await env.DB.prepare('UPDATE product_variants SET stock = stock - 1 WHERE id = ? AND stock > 0').bind(variant.id).run();
     if (!stockUpdate.meta.changes) {
-      if (method === "balance") {
-        await env.DB.prepare("UPDATE users SET balance = balance + ? WHERE id = ?").bind(variant.price_cents, user.id).run();
-        await env.DB.prepare("INSERT INTO balance_transactions (user_id, amount_cents, type, description, order_id) VALUES (?, ?, 'refund', ?, ?)").bind(user.id, variant.price_cents, `Automatic stock rollback for ${orderNumber}`, orderId).run();
-      }
-      await env.DB.prepare("UPDATE orders SET status = 'cancelled' WHERE id = ?").bind(orderId).run();
-      return editOriginalResponse(interaction, { content: "Sorry, this option just went out of stock. No payment was taken.", embeds: [], components: [] });
+      if (method === 'balance') await env.DB.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(variant.price_cents, user.id).run();
+      return editOriginalResponse(interaction, { content: 'Sorry, this option just went out of stock. No order was created.', embeds: [], components: [] });
     }
   }
 
-  const userObj = getInteractionUser(interaction);
-  const channelName = `order-${orderNumber.toLowerCase().replace(/[^a-z0-9-]/g, "").slice(-30)}`;
-  let channel;
+  const status = method === 'balance' ? 'paid' : 'pending_payment';
+  let orderId;
   try {
-    channel = await createPrivateChannel(env, interaction.guild_id, userObj, channelName, `D4rk order ${orderNumber} | ${discordId}`);
-    await env.DB.prepare("UPDATE orders SET discord_channel_id = ? WHERE id = ?").bind(channel.id, orderId).run();
+    const inserted = await env.DB.prepare(`INSERT INTO orders (order_number, user_id, product_id, variant_id, payment_method, amount_cents, status) VALUES (?, ?, ?, ?, ?, ?, ?)`).bind(orderNumber, user.id, variant.product_id, variant.id, method, variant.price_cents, status).run();
+    orderId = inserted.meta.last_row_id;
+    await env.DB.prepare('INSERT INTO payments (order_id, method, amount_cents, status) VALUES (?, ?, ?, ?)').bind(orderId, method, variant.price_cents, status === 'paid' ? 'paid' : 'pending').run();
+    if (method === 'balance') await env.DB.prepare("INSERT INTO balance_transactions (user_id, amount_cents, type, description, order_id) VALUES (?, ?, 'purchase', ?, ?)").bind(user.id, -variant.price_cents, `Purchase: ${variant.product_name}`, orderId).run();
   } catch (error) {
-    console.error("Order channel creation failed:", error);
-    // Order remains recorded; staff can find it with database/admin tooling.
+    if (variant.stock > 0) await env.DB.prepare('UPDATE product_variants SET stock = stock + 1 WHERE id = ?').bind(variant.id).run();
+    if (method === 'balance') await env.DB.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').bind(variant.price_cents, user.id).run();
+    throw error;
   }
 
-  const paymentInfo = paymentInstructions(method, env);
-  const statusText = status === "paid" ? "Paid with D4rk Balance" : "Awaiting payment";
-  const orderEmbed = embed(`Order ${orderNumber}`, [
-    `**Customer:** <@${discordId}>`,
-    `**Product:** ${variant.product_name} — ${variant.name}`,
-    `**Total:** ${money(variant.price_cents)}`,
-    `**Payment:** ${method.toUpperCase()}`,
-    `**Status:** ${statusText}`,
-    "",
-    paymentInfo,
-    "",
-    "Once you have paid, send your payment proof in this ticket. Staff will verify it."
-  ].join("\n"), status === "paid" ? 0x57F287 : 0xFEE75C);
-
-  const components = isStaff(interaction, env) ? [] : [];
-  if (channel) {
-    await discordRequest(env, `/channels/${channel.id}/messages`, "POST", {
-      content: `<@${discordId}> ${env.STAFF_ROLE_ID ? `<@&${env.STAFF_ROLE_ID}>` : ""}`,
-      embeds: [orderEmbed],
-      components: [{
-        type: 1, components: [
-          { type: 2, style: 3, label: "Confirm payment", custom_id: `order_paid:${orderNumber}` },
-          { type: 2, style: 4, label: "Cancel order", custom_id: `order_cancel:${orderNumber}` }
-        ]
-      }]
-    });
+  const order = { id: orderId, order_number: orderNumber, amount_cents: variant.price_cents, payment_method: method };
+  if (method === 'balance') {
+    try {
+      const channel = await openPaidOrderTicket(env, interaction.guild_id, order, discordId, variant.product_name, variant.name);
+      await env.DB.prepare("INSERT INTO admin_logs (admin_discord_id, action, details) VALUES (?, 'customer_order_paid_balance', ?)").bind(discordId, orderNumber).run();
+      return editOriginalResponse(interaction, { content: `✅ Payment completed using D4rk Balance. Your private order ticket is ready: <#${channel.id}>`, embeds: [], components: [] });
+    } catch (error) {
+      console.error('Could not open paid order ticket:', error);
+      return editOriginalResponse(interaction, { content: `✅ Your D4rk Balance payment was recorded, but the ticket could not be opened. Please contact staff with order **${orderNumber}**.`, embeds: [], components: [] });
+    }
   }
 
-  await env.DB.prepare("INSERT INTO admin_logs (admin_discord_id, action, details) VALUES (?, 'customer_order', ?)").bind(discordId, `${orderNumber} - ${method}`).run();
+  const instructions = paymentInstructions(method, env);
+  const missingDetails = instructions.includes('not configured');
   return editOriginalResponse(interaction, {
-    content: `✅ Your order **${orderNumber}** has been created.${channel ? `\nYour private ticket: <#${channel.id}>` : "\nThe order was saved, but the ticket could not be created. Please contact staff."}`,
-    embeds: [embed("Order summary", `**${variant.product_name} — ${variant.name}**\n**Total:** ${money(variant.price_cents)}\n**Payment:** ${method.toUpperCase()}\n**Status:** ${statusText}`)],
-    components: []
+    content: `**Order ${orderNumber} — payment instructions (private)**\n\n${instructions}\n\n**Amount due:** ${money(variant.price_cents)}\n**Reference:** \`${orderNumber}\`\n\nAfter completing the transfer, click **I've paid** below. This sends a verification request to D4rk staff. Your private order ticket will only open after staff confirms receipt.`,
+    embeds: [embed('Payment pending', `${variant.product_name} — ${variant.name}\n${money(variant.price_cents)}\n\n${missingDetails ? '⚠️ Payment details are not configured. Contact staff before sending money.' : 'Do not send payment until you have checked the details above.'}`, 0xFEE75C)],
+    components: missingDetails ? [] : [{ type: 1, components: [{ type: 2, style: 3, label: "I've paid", custom_id: `payment_submitted:${orderNumber}` }] }]
   });
+}
+
+async function submitPayment(interaction, env, orderNumber) {
+  const discordId = getInteractionUserId(interaction);
+  const order = await env.DB.prepare(`SELECT o.id, o.order_number, o.amount_cents, o.payment_method, o.status, p.name AS product_name, v.name AS variant_name FROM orders o JOIN users u ON u.id = o.user_id JOIN products p ON p.id = o.product_id JOIN product_variants v ON v.id = o.variant_id WHERE o.order_number = ? AND u.discord_id = ?`).bind(orderNumber, discordId).first();
+  if (!order || order.status !== 'pending_payment') return editOriginalResponse(interaction, { content: 'This order cannot be submitted for verification (it may already be processed).', embeds: [], components: [] });
+  const updated = await env.DB.prepare("UPDATE orders SET status = 'payment_submitted', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending_payment'").bind(order.id).run();
+  if (!updated.meta.changes) return editOriginalResponse(interaction, { content: 'This payment was already submitted or processed.', embeds: [], components: [] });
+  await env.DB.prepare("UPDATE payments SET status = 'submitted' WHERE order_id = ? AND status = 'pending'").bind(order.id).run();
+  let notified = false;
+  try { notified = await createOrderReviewMessage(env, order, discordId, order.product_name, order.variant_name); }
+  catch (error) { console.error('Staff payment notification failed:', error); }
+  return editOriginalResponse(interaction, { content: `🕒 Your payment confirmation for **${orderNumber}** has been ${notified ? 'sent to D4rk staff for verification' : 'recorded'}. Your private order ticket will open only after staff confirms the payment.${notified ? '' : '\n⚠️ Staff notification channel is not configured. Please contact staff and provide your order number.'}`, embeds: [], components: [] });
 }
 
 // ---------------- STAFF ORDER ACTIONS ----------------
 
 async function orderAction(interaction, env, action, orderNumber) {
-  if (!isStaff(interaction, env)) {
-    return editOriginalResponse(interaction, "❌ Only D4rk staff can use these order controls.");
-  }
-  const order = await env.DB.prepare("SELECT id, user_id, amount_cents, status, variant_id, payment_method FROM orders WHERE order_number = ?").bind(orderNumber).first();
-  if (!order) return editOriginalResponse(interaction, "❌ Order not found.");
+  if (!isStaff(interaction, env)) return editOriginalResponse(interaction, '❌ Only D4rk staff can use these order controls.');
+  const order = await env.DB.prepare(`SELECT o.id, o.user_id, o.amount_cents, o.status, o.variant_id, o.payment_method, o.discord_channel_id, u.discord_id, p.name AS product_name, v.name AS variant_name FROM orders o JOIN users u ON u.id = o.user_id JOIN products p ON p.id = o.product_id JOIN product_variants v ON v.id = o.variant_id WHERE o.order_number = ?`).bind(orderNumber).first();
+  if (!order) return editOriginalResponse(interaction, '❌ Order not found.');
 
-  if (action === "paid") {
-    if (order.status !== "pending_payment") return editOriginalResponse(interaction, `❌ Order is currently **${order.status}**.`);
-    await env.DB.batch([
-      env.DB.prepare("UPDATE orders SET status = 'paid', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending_payment'").bind(order.id),
-      env.DB.prepare("UPDATE payments SET status = 'paid' WHERE order_id = ? AND status = 'pending'").bind(order.id),
-      env.DB.prepare("INSERT INTO admin_logs (admin_discord_id, action, details) VALUES (?, 'approve_order', ?)").bind(getInteractionUserId(interaction), orderNumber)
-    ]);
-    return editOriginalResponse(interaction, { content: `✅ Payment for **${orderNumber}** confirmed by <@${getInteractionUserId(interaction)}> .`, components: [] });
+  if (action === 'paid') {
+    if (!['pending_payment', 'payment_submitted'].includes(order.status)) return editOriginalResponse(interaction, `❌ Order is currently **${order.status}**.`);
+    const updated = await env.DB.prepare("UPDATE orders SET status = 'paid', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status IN ('pending_payment', 'payment_submitted')").bind(order.id).run();
+    if (!updated.meta.changes) return editOriginalResponse(interaction, '❌ This order has already been processed.');
+    await env.DB.prepare("UPDATE payments SET status = 'paid' WHERE order_id = ? AND status IN ('pending', 'submitted')").bind(order.id).run();
+    await env.DB.prepare("INSERT INTO admin_logs (admin_discord_id, action, details) VALUES (?, 'approve_order', ?)").bind(getInteractionUserId(interaction), orderNumber).run();
+    try {
+      const channel = await openPaidOrderTicket(env, interaction.guild_id, order, order.discord_id, order.product_name, order.variant_name);
+      return editOriginalResponse(interaction, { content: `✅ Payment for **${orderNumber}** verified. Private order ticket created: <#${channel.id}>`, components: [] });
+    } catch (error) {
+      console.error('Paid order ticket creation failed:', error);
+      return editOriginalResponse(interaction, { content: `✅ Payment for **${orderNumber}** verified, but the private ticket could not be created. Please check bot permissions.`, components: [] });
+    }
   }
 
-  if (action === "cancel") {
-    if (!["pending_payment", "paid"].includes(order.status)) return editOriginalResponse(interaction, `❌ Order is currently **${order.status}**.`);
-    await env.DB.prepare("UPDATE orders SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = ?").bind(order.id, order.status).run();
-    await env.DB.prepare("UPDATE payments SET status = 'cancelled' WHERE order_id = ? AND status IN ('pending', 'paid')").bind(order.id).run();
-    if (order.variant_id) {
-      // Restore stock for a cancelled order.
-      await env.DB.prepare("UPDATE product_variants SET stock = stock + 1 WHERE id = ? AND stock >= 0").bind(order.variant_id).run();
-    }
-    if (order.payment_method === "balance" && order.status === "paid") {
-      await env.DB.prepare("UPDATE users SET balance = balance + ? WHERE id = ?").bind(order.amount_cents, order.user_id).run();
-      await env.DB.prepare("INSERT INTO balance_transactions (user_id, amount_cents, type, description, order_id, admin_discord_id) VALUES (?, ?, 'refund', ?, ?, ?)").bind(order.user_id, order.amount_cents, `Cancellation refund ${orderNumber}`, order.id, getInteractionUserId(interaction)).run();
-      await env.DB.prepare("UPDATE orders SET status = 'refunded' WHERE id = ?").bind(order.id).run();
-    }
-    await env.DB.prepare("INSERT INTO admin_logs (admin_discord_id, action, details) VALUES (?, 'cancel_order', ?)").bind(getInteractionUserId(interaction), orderNumber).run();
-    return editOriginalResponse(interaction, `🛑 Order **${orderNumber}** cancelled by staff.`);
+  if (action === 'cancel') {
+    if (!['pending_payment', 'payment_submitted'].includes(order.status)) return editOriginalResponse(interaction, `❌ Cannot reject an order in status **${order.status}**.`);
+    const updated = await env.DB.prepare("UPDATE orders SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status IN ('pending_payment', 'payment_submitted')").bind(order.id).run();
+    if (!updated.meta.changes) return editOriginalResponse(interaction, '❌ This order has already been processed.');
+    await env.DB.prepare("UPDATE payments SET status = 'rejected' WHERE order_id = ? AND status IN ('pending', 'submitted')").bind(order.id).run();
+    await env.DB.prepare('UPDATE product_variants SET stock = stock + 1 WHERE id = ? AND stock >= 0').bind(order.variant_id).run();
+    await env.DB.prepare("INSERT INTO admin_logs (admin_discord_id, action, details) VALUES (?, 'reject_order_payment', ?)").bind(getInteractionUserId(interaction), orderNumber).run();
+    try { await discordRequest(env, `/users/@me`); } catch (_) {}
+    return editOriginalResponse(interaction, { content: `🛑 Payment/order **${orderNumber}** rejected. Reserved stock has been restored.`, components: [] });
   }
 }
 
@@ -471,16 +496,19 @@ async function createOrder(interaction, env) {
 }
 
 async function approveOrder(interaction, env) {
-  if (!isStaff(interaction, env)) return "❌ Staff only.";
-  const orderNumber = getOption(interaction, "order");
-  const order = await env.DB.prepare("SELECT id, status FROM orders WHERE order_number = ?").bind(orderNumber).first();
-  if (!order || order.status !== "pending_payment") return "❌ Order not found, already paid or not awaiting payment.";
-  await env.DB.batch([
-    env.DB.prepare("UPDATE orders SET status = 'paid', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending_payment'").bind(order.id),
-    env.DB.prepare("UPDATE payments SET status = 'paid' WHERE order_id = ? AND status = 'pending'").bind(order.id),
-    env.DB.prepare("INSERT INTO admin_logs (admin_discord_id, action, details) VALUES (?, 'approve_order', ?)").bind(getInteractionUserId(interaction), orderNumber)
-  ]);
-  return `✅ Order **${orderNumber}** marked as paid.`;
+  if (!isStaff(interaction, env)) return '❌ Staff only.';
+  const orderNumber = getOption(interaction, 'order');
+  const order = await env.DB.prepare(`SELECT o.id, o.user_id, o.amount_cents, o.status, o.variant_id, o.payment_method, o.discord_channel_id, u.discord_id, p.name AS product_name, v.name AS variant_name FROM orders o JOIN users u ON u.id = o.user_id JOIN products p ON p.id = o.product_id JOIN product_variants v ON v.id = o.variant_id WHERE o.order_number = ?`).bind(orderNumber).first();
+  if (!order || !['pending_payment', 'payment_submitted'].includes(order.status)) return '❌ Order not found or already processed.';
+  const updated = await env.DB.prepare("UPDATE orders SET status = 'paid', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status IN ('pending_payment', 'payment_submitted')").bind(order.id).run();
+  if (!updated.meta.changes) return '❌ This order has already been processed.';
+  await env.DB.prepare("UPDATE payments SET status = 'paid' WHERE order_id = ? AND status IN ('pending', 'submitted')").bind(order.id).run();
+  let channelText = '';
+  try {
+    const channel = await openPaidOrderTicket(env, interaction.guild_id, order, order.discord_id, order.product_name, order.variant_name);
+    channelText = `\nPrivate ticket: <#${channel.id}>`;
+  } catch (error) { console.error('Could not open approved order ticket:', error); channelText = '\nPayment confirmed, but ticket creation failed. Check bot permissions.'; }
+  return `✅ Order **${orderNumber}** marked as paid.${channelText}`;
 }
 
 async function refundOrder(interaction, env) {
@@ -507,7 +535,7 @@ async function handleCommand(interaction, env) {
     case "createorder": return createOrder(interaction, env);
     case "approveorder": return approveOrder(interaction, env);
     case "refund": return refundOrder(interaction, env);
-    case "shop": return showShop(interaction, env);
+    case "shop": return publishShop(interaction, env);
     case "addproduct": return addProduct(interaction, env);
     case "editproduct": return editProduct(interaction, env);
     case "deleteproduct": return deleteProduct(interaction, env);
@@ -520,19 +548,22 @@ async function handleCommand(interaction, env) {
 }
 
 async function handleComponent(interaction, env) {
-  const id = interaction.data.custom_id || "";
+  const id = interaction.data.custom_id || '';
   const values = interaction.data.values || [];
-  if (id === "shop_back") return showShop(interaction, env);
-  if (id === "shop_product") return showVariants(interaction, env, Number(values[0]));
-  if (id.startsWith("shop_variant:")) return showPaymentMethods(interaction, env, Number(values[0]));
-  if (id.startsWith("shop_payment:")) {
+  if (id === 'shop_back') return showShop(interaction, env);
+  if (id === 'shop_product') return showVariants(interaction, env, Number(values[0]));
+  if (id.startsWith('shop_variant:')) return showPaymentMethods(interaction, env, Number(values[0]));
+  if (id.startsWith('shop_payment:')) {
     const method = values[0];
-    if (!["ltc", "paypal", "bank", "balance"].includes(method)) return editOriginalResponse(interaction, "Invalid payment method.");
-    return createCustomerOrder(interaction, env, Number(id.split(":")[1]), method);
+    if (!['ltc', 'paypal', 'bank', 'balance'].includes(method)) return editOriginalResponse(interaction, 'Invalid payment method.');
+    return createCustomerOrder(interaction, env, Number(id.split(':')[1]), method);
   }
-  if (id.startsWith("order_paid:")) return orderAction(interaction, env, "paid", id.slice("order_paid:".length));
-  if (id.startsWith("order_cancel:")) return orderAction(interaction, env, "cancel", id.slice("order_cancel:".length));
-  return editOriginalResponse(interaction, "Unsupported action.");
+  if (id.startsWith('payment_submitted:')) return submitPayment(interaction, env, id.slice('payment_submitted:'.length));
+  if (id.startsWith('order_verify:')) return orderAction(interaction, env, 'paid', id.slice('order_verify:'.length));
+  if (id.startsWith('order_reject:')) return orderAction(interaction, env, 'cancel', id.slice('order_reject:'.length));
+  if (id.startsWith('order_paid:')) return orderAction(interaction, env, 'paid', id.slice('order_paid:'.length));
+  if (id.startsWith('order_cancel:')) return orderAction(interaction, env, 'cancel', id.slice('order_cancel:'.length));
+  return editOriginalResponse(interaction, 'Unsupported action.');
 }
 
 // ---------------- OAUTH ----------------
@@ -662,14 +693,6 @@ export default {
 
         if (interaction.type === 2) {
           const name = interaction.data.name;
-          if (name === "shop") {
-            const response = json({ type: 5, data: { flags: 64 } });
-            ctx.waitUntil((async () => {
-              try { await showShop(interaction, env); }
-              catch (error) { console.error("Shop error:", error); await editOriginalResponse(interaction, "❌ Could not load the shop. Please contact staff."); }
-            })());
-            return response;
-          }
           const response = json({ type: 5, data: { flags: 64 } });
           ctx.waitUntil((async () => {
             try {
@@ -688,7 +711,7 @@ export default {
         }
 
         if (interaction.type === 3) {
-          const response = json({ type: 6 });
+          const response = json({ type: 5, data: { flags: 64 } });
           ctx.waitUntil((async () => {
             try { await handleComponent(interaction, env); }
             catch (error) {
