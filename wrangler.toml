@@ -1,3 +1,8 @@
 name = "d4rktick"
 main = "src/index.js"
 compatibility_date = "2026-11-21"
+
+[vars]
+APPLICATION_ID = "1573691824617431162"
+GUILD_ID = "1518624035460878367"
+PUBLIC_KEY = "b2069b6dba11137402403cfc412f3a03f8a1b37597cc0ae9e785f962d1cf7861"
