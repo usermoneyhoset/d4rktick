@@ -1,1 +1,8 @@
-
+{
+  "name": "d4rk-tickets",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "echo Build complete"
+  }
+}
