@@ -2,6 +2,16 @@ name = "d4rktick"
 main = "src/index.js"
 compatibility_date = "2026-11-21"
 
+[assets]
+directory = "./public"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "d4rk-tickets"
+database_id = "REMPLACE_PAR_TON_DATABASE_ID"
+
 [vars]
 APPLICATION_ID = "1573691824617431162"
 GUILD_ID = "1518624035460878367"
