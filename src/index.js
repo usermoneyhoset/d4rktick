@@ -2,6 +2,10 @@ const DISCORD_API = "https://discord.com/api/v10";
 const SESSION_DURATION = 7 * 24 * 60 * 60;
 const OAUTH_STATE_DURATION = 10 * 60;
 
+// =====================================
+// HELPERS
+// =====================================
+
 function json(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data), {
     status,
@@ -27,10 +31,12 @@ async function hash(value) {
 
 function getCookie(request, name) {
   const cookies = request.headers.get("Cookie") || "";
+
   for (const cookie of cookies.split(";")) {
     const [key, ...value] = cookie.trim().split("=");
     if (key === name) return value.join("=");
   }
+
   return null;
 }
 
@@ -44,6 +50,46 @@ function sessionCookie(token, maxAge = SESSION_DURATION) {
     `Max-Age=${maxAge}`
   ].join("; ");
 }
+
+// Récupération compatible avec les interactions Discord
+function getInteractionUser(interaction) {
+  return interaction.member?.user || interaction.user || null;
+}
+
+function getInteractionUserId(interaction) {
+  return getInteractionUser(interaction)?.id || null;
+}
+
+function getOption(interaction, name) {
+  return interaction.data.options?.find(o => o.name === name)?.value;
+}
+
+function isStaff(interaction, env) {
+  return Boolean(
+    env.STAFF_ROLE_ID &&
+    interaction.member?.roles?.includes(env.STAFF_ROLE_ID)
+  );
+}
+
+function money(cents) {
+  return `€${(cents / 100).toFixed(2)}`;
+}
+
+function parseAmount(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return null;
+  }
+
+  const cents = Math.round(value * 100);
+
+  if (cents <= 0 || cents > 100000000) return null;
+
+  return cents;
+}
+
+// =====================================
+// DISCORD API
+// =====================================
 
 async function verifySignature(request, body, publicKeyHex) {
   const signature = request.headers.get("X-Signature-Ed25519");
@@ -87,7 +133,9 @@ async function discordRequest(env, path, method = "GET", data = null) {
   const result = await response.json().catch(() => ({}));
 
   if (!response.ok) {
-    throw new Error(`Discord API ${response.status}: ${JSON.stringify(result)}`);
+    throw new Error(
+      `Discord API ${response.status}: ${JSON.stringify(result)}`
+    );
   }
 
   return result;
@@ -104,37 +152,17 @@ async function editOriginalResponse(interaction, content) {
   );
 }
 
-function getOption(interaction, name) {
-  return interaction.data.options?.find(o => o.name === name)?.value;
-}
-
-function isStaff(interaction, env) {
-  return Boolean(
-    env.STAFF_ROLE_ID &&
-    interaction.member?.roles?.includes(env.STAFF_ROLE_ID)
-  );
-}
-
-function money(cents) {
-  return `€${(cents / 100).toFixed(2)}`;
-}
-
-function parseAmount(value) {
-  if (typeof value !== "number" || !Number.isFinite(value)) return null;
-  const cents = Math.round(value * 100);
-  if (cents <= 0 || cents > 100000000) return null;
-  return cents;
-}
-
 // =====================================
 // TICKETS
 // =====================================
 
 async function createTicket(interaction, env) {
-  const user = interaction.member?.user || interaction.user;
+  const user = getInteractionUser(interaction);
   const guildId = interaction.guild_id;
 
-  if (!guildId || !user) throw new Error("Guild or user missing");
+  if (!guildId || !user?.id) {
+    throw new Error("Guild or user missing");
+  }
 
   const permissions = "68608";
 
@@ -159,7 +187,7 @@ async function createTicket(interaction, env) {
     });
   }
 
-  const username = user.username
+  const username = (user.username || "user")
     .toLowerCase()
     .replace(/[^a-z0-9-]/g, "-")
     .slice(0, 80);
@@ -169,7 +197,7 @@ async function createTicket(interaction, env) {
     `/guilds/${guildId}/channels`,
     "POST",
     {
-      name: `ticket-${username || "user"}`,
+      name: `ticket-${username}`,
       type: 0,
       ...(env.TICKET_CATEGORY_ID
         ? { parent_id: env.TICKET_CATEGORY_ID }
@@ -198,33 +226,52 @@ async function createTicket(interaction, env) {
 // =====================================
 
 async function balanceCommand(interaction, env) {
-  const discordId = interaction.user.id;
+  const discordId = getInteractionUserId(interaction);
+
+  if (!discordId) {
+    throw new Error("Discord user ID missing");
+  }
 
   const user = await env.DB.prepare(
     "SELECT balance FROM users WHERE discord_id = ?"
   ).bind(discordId).first();
 
-  if (!user) return "Your D4rk account was not found.";
+  if (!user) {
+    return "Your D4rk account was not found. Please log in first.";
+  }
 
   return `💰 Your D4rk balance: **${money(user.balance)}**`;
 }
+
+// =====================================
+// ADD / REMOVE BALANCE
+// =====================================
 
 async function changeBalance(interaction, env, type) {
   if (!isStaff(interaction, env)) {
     return "❌ You are not authorized to use this command.";
   }
 
+  const actorId = getInteractionUserId(interaction);
+
+  if (!actorId) {
+    throw new Error("Staff Discord ID missing");
+  }
+
   const discordId = getOption(interaction, "user");
   const cents = parseAmount(getOption(interaction, "amount"));
   const reason = getOption(interaction, "reason") || "Staff adjustment";
 
+  if (!discordId) return "❌ Customer Discord ID missing.";
   if (!cents) return "❌ Invalid amount.";
 
   const user = await env.DB.prepare(
     "SELECT id FROM users WHERE discord_id = ?"
   ).bind(discordId).first();
 
-  if (!user) return "❌ Customer account not found.";
+  if (!user) {
+    return "❌ Customer account not found. The customer must log in first.";
+  }
 
   const change = type === "credit" ? cents : -cents;
 
@@ -245,15 +292,16 @@ async function changeBalance(interaction, env, type) {
       change,
       type,
       reason,
-      interaction.user.id
+      actorId
     ),
 
     env.DB.prepare(`
-      INSERT INTO admin_logs (admin_discord_id, action, details)
+      INSERT INTO admin_logs
+      (admin_discord_id, action, details)
       SELECT ?, ?, ?
       WHERE changes() = 1
     `).bind(
-      interaction.user.id,
+      actorId,
       type,
       `${discordId}: ${money(cents)} - ${reason}`
     )
@@ -263,7 +311,11 @@ async function changeBalance(interaction, env, type) {
     return "❌ Insufficient balance or transaction failed.";
   }
 
-  return `✅ ${type === "credit" ? "Added" : "Removed"} **${money(cents)}** ${type === "credit" ? "to" : "from"} <@${discordId}>.`;
+  return (
+    `✅ ${type === "credit" ? "Added" : "Removed"} ` +
+    `**${money(cents)}** ` +
+    `${type === "credit" ? "to" : "from"} <@${discordId}>.`
+  );
 }
 
 // =====================================
@@ -271,12 +323,15 @@ async function changeBalance(interaction, env, type) {
 // =====================================
 
 async function historyCommand(interaction, env) {
-  const discordId = getOption(interaction, "user") || interaction.user.id;
+  const actorId = getInteractionUserId(interaction);
 
-  if (
-    discordId !== interaction.user.id &&
-    !isStaff(interaction, env)
-  ) {
+  if (!actorId) {
+    throw new Error("Discord user ID missing");
+  }
+
+  const discordId = getOption(interaction, "user") || actorId;
+
+  if (discordId !== actorId && !isStaff(interaction, env)) {
     return "❌ Staff only.";
   }
 
@@ -297,7 +352,9 @@ async function historyCommand(interaction, env) {
   if (!results.length) return "No transactions found.";
 
   const lines = results.map(t =>
-    `${t.amount_cents >= 0 ? "🟢" : "🔴"} **${money(Math.abs(t.amount_cents))}** — ${t.type}\n${t.description || "No description"}`
+    `${t.amount_cents >= 0 ? "🟢" : "🔴"} ` +
+    `**${money(Math.abs(t.amount_cents))}** — ${t.type}\n` +
+    `${t.description || "No description"}`
   );
 
   return `📜 **D4rk Transaction History**\n\n${lines.join("\n\n")}`;
@@ -312,9 +369,12 @@ async function createOrder(interaction, env) {
     return "❌ Staff only.";
   }
 
+  const actorId = getInteractionUserId(interaction);
   const discordId = getOption(interaction, "user");
   const variantId = getOption(interaction, "variant_id");
   const method = getOption(interaction, "payment_method");
+
+  if (!actorId) throw new Error("Staff Discord ID missing");
 
   if (!["ltc", "paypal", "bank", "balance"].includes(method)) {
     return "❌ Invalid payment method.";
@@ -336,7 +396,8 @@ async function createOrder(interaction, env) {
 
   if (!user) return "❌ Customer account not found.";
 
-  const orderNumber = `D4-${Date.now()}-${crypto.randomUUID().slice(0, 5)}`;
+  const orderNumber =
+    `D4-${Date.now()}-${crypto.randomUUID().slice(0, 5)}`;
 
   if (method === "balance") {
     const results = await env.DB.batch([
@@ -363,7 +424,8 @@ async function createOrder(interaction, env) {
       env.DB.prepare(`
         INSERT INTO payments (order_id, method, amount_cents, status)
         SELECT id, 'balance', amount_cents, 'paid'
-        FROM orders WHERE order_number = ?
+        FROM orders
+        WHERE order_number = ?
         AND status = 'paid'
         AND changes() = 1
       `).bind(orderNumber),
@@ -372,7 +434,8 @@ async function createOrder(interaction, env) {
         INSERT INTO balance_transactions
         (user_id, amount_cents, type, description, order_id)
         SELECT ?, ?, 'purchase', ?, id
-        FROM orders WHERE order_number = ?
+        FROM orders
+        WHERE order_number = ?
         AND changes() = 1
       `).bind(
         user.id,
@@ -404,7 +467,8 @@ async function createOrder(interaction, env) {
       env.DB.prepare(`
         INSERT INTO payments (order_id, method, amount_cents, status)
         SELECT id, ?, ?, 'pending'
-        FROM orders WHERE order_number = ?
+        FROM orders
+        WHERE order_number = ?
       `).bind(method, variant.price_cents, orderNumber)
     ]);
   }
@@ -413,7 +477,7 @@ async function createOrder(interaction, env) {
     INSERT INTO admin_logs (admin_discord_id, action, details)
     VALUES (?, 'create_order', ?)
   `).bind(
-    interaction.user.id,
+    actorId,
     `${orderNumber} - ${discordId} - ${method}`
   ).run();
 
@@ -434,7 +498,10 @@ async function createOrder(interaction, env) {
 async function approveOrder(interaction, env) {
   if (!isStaff(interaction, env)) return "❌ Staff only.";
 
+  const actorId = getInteractionUserId(interaction);
   const orderNumber = getOption(interaction, "order");
+
+  if (!actorId) throw new Error("Staff Discord ID missing");
 
   const results = await env.DB.batch([
     env.DB.prepare(`
@@ -448,7 +515,8 @@ async function approveOrder(interaction, env) {
       SET status = 'paid'
       WHERE order_id = (
         SELECT id FROM orders WHERE order_number = ?
-      ) AND status = 'pending'
+      )
+      AND status = 'pending'
       AND changes() = 1
     `).bind(orderNumber),
 
@@ -456,7 +524,7 @@ async function approveOrder(interaction, env) {
       INSERT INTO admin_logs (admin_discord_id, action, details)
       SELECT ?, 'approve_order', ?
       WHERE changes() = 1
-    `).bind(interaction.user.id, orderNumber)
+    `).bind(actorId, orderNumber)
   ]);
 
   if (!results[0].meta.changes) {
@@ -473,7 +541,10 @@ async function approveOrder(interaction, env) {
 async function refundOrder(interaction, env) {
   if (!isStaff(interaction, env)) return "❌ Staff only.";
 
+  const actorId = getInteractionUserId(interaction);
   const orderNumber = getOption(interaction, "order");
+
+  if (!actorId) throw new Error("Staff Discord ID missing");
 
   const order = await env.DB.prepare(`
     SELECT id, user_id, amount_cents
@@ -511,7 +582,7 @@ async function refundOrder(interaction, env) {
       order.amount_cents,
       `Refund for ${orderNumber}`,
       order.id,
-      interaction.user.id
+      actorId
     ),
 
     env.DB.prepare(`
@@ -525,14 +596,17 @@ async function refundOrder(interaction, env) {
       INSERT INTO admin_logs (admin_discord_id, action, details)
       SELECT ?, 'refund', ?
       WHERE changes() = 1
-    `).bind(interaction.user.id, orderNumber)
+    `).bind(actorId, orderNumber)
   ]);
 
   if (!results[0].meta.changes || !results[1].meta.changes) {
     return "❌ Refund failed. Please check the order.";
   }
 
-  return `✅ **${orderNumber} refunded.**\n${money(order.amount_cents)} credited to the customer's D4rk balance.`;
+  return (
+    `✅ **${orderNumber} refunded.**\n` +
+    `${money(order.amount_cents)} credited to the customer's D4rk balance.`
+  );
 }
 
 // =====================================
@@ -666,6 +740,10 @@ async function oauthCallback(request, env) {
   const databaseUser = await env.DB.prepare(
     "SELECT id FROM users WHERE discord_id = ?"
   ).bind(discordUser.id).first();
+
+  if (!databaseUser) {
+    throw new Error("Database user creation failed");
+  }
 
   const sessionToken = randomToken();
   const tokenHash = await hash(sessionToken);
@@ -852,6 +930,7 @@ export default {
         });
       }
 
+      // REGISTER SLASH COMMANDS
       if (url.pathname === "/register" && request.method === "GET") {
         if (
           !env.REGISTER_SECRET ||
@@ -884,7 +963,11 @@ export default {
       ) {
         const body = await request.text();
 
-        const valid = await verifySignature(request, body, env.PUBLIC_KEY);
+        const valid = await verifySignature(
+          request,
+          body,
+          env.PUBLIC_KEY
+        );
 
         if (!valid) {
           return new Response("Invalid signature", { status: 401 });
@@ -899,7 +982,6 @@ export default {
         if (interaction.type === 2) {
           const name = interaction.data.name;
 
-          // Acknowledge immediately to Discord
           const response = json({
             type: 5,
             data: { flags: 64 }
@@ -919,6 +1001,7 @@ export default {
               await editOriginalResponse(interaction, result);
             } catch (error) {
               console.error("Command failed:", error);
+
               await editOriginalResponse(
                 interaction,
                 "❌ An error occurred. Please contact D4rk staff."
@@ -931,7 +1014,10 @@ export default {
 
         return json({
           type: 4,
-          data: { content: "Unsupported interaction.", flags: 64 }
+          data: {
+            content: "Unsupported interaction.",
+            flags: 64
+          }
         });
       }
 
@@ -947,7 +1033,9 @@ export default {
 
     } catch (error) {
       console.error("D4rk backend error:", error);
-      return json({ error: "An internal server error occurred." }, 500);
+      return json({
+        error: "An internal server error occurred."
+      }, 500);
     }
   }
 };
