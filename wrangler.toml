@@ -10,7 +10,7 @@ not_found_handling = "single-page-application"
 [[d1_databases]]
 binding = "DB"
 database_name = "d4rk-tickets"
-database_id = "REMPLACE_PAR_TON_DATABASE_ID"
+database_id = "af2bc035-eb6d-47cc-ad8d-3ea671d5f87e"
 
 [vars]
 APPLICATION_ID = "1573691824617431162"
