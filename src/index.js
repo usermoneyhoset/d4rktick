@@ -4,11 +4,18 @@ async function verifySignature(request, body, publicKeyHex) {
   const signature = request.headers.get("X-Signature-Ed25519");
   const timestamp = request.headers.get("X-Signature-Timestamp");
 
-  if (!signature || !timestamp) return false;
+  if (!signature || !timestamp || !publicKeyHex) return false;
 
   try {
-    const hexToBytes = (hex) =>
-      new Uint8Array(hex.match(/.{1,2}/g).map((b) => parseInt(b, 16)));
+    const hexToBytes = (hex) => {
+      if (!/^[0-9a-f]+$/i.test(hex) || hex.length % 2 !== 0) {
+        throw new Error("Invalid hex");
+      }
+
+      return new Uint8Array(
+        hex.match(/.{2}/g).map((b) => parseInt(b, 16))
+      );
+    };
 
     const key = await crypto.subtle.importKey(
       "raw",
@@ -42,15 +49,27 @@ async function discordRequest(env, path, method = "GET", data = null) {
   const result = await response.json().catch(() => ({}));
 
   if (!response.ok) {
-    throw new Error(`Discord API ${response.status}: ${JSON.stringify(result)}`);
+    throw new Error(
+      `Discord API ${response.status}: ${JSON.stringify(result)}`
+    );
   }
 
   return result;
 }
 
 async function createTicket(interaction, env) {
-  const user = interaction.member.user;
+  const user = interaction.member?.user || interaction.user;
   const guildId = interaction.guild_id;
+
+  if (!guildId || !user) {
+    throw new Error("Guild or user missing");
+  }
+
+  // Permissions:
+  // View Channel = 1024
+  // Send Messages = 2048
+  // Read Message History = 65536
+  const permissions = "68608";
 
   const overwrites = [
     {
@@ -61,7 +80,7 @@ async function createTicket(interaction, env) {
     {
       id: user.id,
       type: 1,
-      allow: "3072",
+      allow: permissions,
     },
   ];
 
@@ -69,22 +88,27 @@ async function createTicket(interaction, env) {
     overwrites.push({
       id: env.STAFF_ROLE_ID,
       type: 0,
-      allow: "3072",
+      allow: permissions,
     });
   }
+
+  const username = user.username
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, "-")
+    .slice(0, 80);
 
   const channel = await discordRequest(
     env,
     `/guilds/${guildId}/channels`,
     "POST",
     {
-      name: `ticket-${user.username}`.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 90),
+      name: `ticket-${username || "user"}`,
       type: 0,
       ...(env.TICKET_CATEGORY_ID
         ? { parent_id: env.TICKET_CATEGORY_ID }
         : {}),
       permission_overwrites: overwrites,
-      topic: `Ticket de ${user.username} (${user.id})`,
+      topic: `Ticket de ${user.username} | ID: ${user.id}`,
     }
   );
 
@@ -93,61 +117,130 @@ async function createTicket(interaction, env) {
     `/channels/${channel.id}/messages`,
     "POST",
     {
-      content: `Bienvenue <@${user.id}> dans ton ticket !\nExplique ton problème, le staff te répondra dès que possible.`,
+      content:
+        `Bienvenue <@${user.id}> dans ton ticket !\n\n` +
+        "Explique ton problème ici. Le staff D4rk te répondra dès que possible.",
     }
   );
 
   return channel;
 }
 
+async function editOriginalResponse(interaction, content) {
+  return fetch(
+    `${DISCORD_API}/webhooks/${interaction.application_id}/${interaction.token}/messages/@original`,
+    {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ content }),
+    }
+  );
+}
+
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
+    // Register slash commands
+    if (url.pathname === "/register") {
+      if (url.searchParams.get("key") !== env.REGISTER_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+
+      const commands = [
+        {
+          name: "ticket",
+          description: "Ouvrir un ticket auprès du support D4rk",
+          type: 1,
+        },
+      ];
+
+      const response = await fetch(
+        `${DISCORD_API}/applications/${env.APPLICATION_ID}/guilds/${env.GUILD_ID}/commands`,
+        {
+          method: "PUT",
+          headers: {
+            Authorization: `Bot ${env.DISCORD_TOKEN}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(commands),
+        }
+      );
+
+      return new Response(await response.text(), {
+        status: response.status,
+      });
+    }
+
+    // Health check
     if (request.method !== "POST") {
-      return new Response("D4rk Tickets is online.", {
+      return new Response("D4rk Tickets is online!", {
         status: 200,
       });
     }
 
+    // Verify Discord signature
     const body = await request.text();
 
-    const valid = await verifySignature(request, body, env.PUBLIC_KEY);
+    const valid = await verifySignature(
+      request,
+      body,
+      env.PUBLIC_KEY
+    );
 
     if (!valid) {
-      return new Response("Invalid signature", { status: 401 });
+      return new Response("Invalid signature", {
+        status: 401,
+      });
     }
 
     const interaction = JSON.parse(body);
 
-    // Discord endpoint verification
+    // Discord endpoint verification ping
     if (interaction.type === 1) {
       return Response.json({ type: 1 });
     }
 
     // Slash command
-    if (interaction.type === 2 && interaction.data.name === "ticket") {
-      try {
-        const channel = await createTicket(interaction, env);
+    if (
+      interaction.type === 2 &&
+      interaction.data.name === "ticket"
+    ) {
+      // Respond immediately so Discord doesn't time out
+      const immediateResponse = Response.json({
+        type: 5,
+        data: {
+          flags: 64,
+        },
+      });
 
-        return Response.json({
-          type: 4,
-          data: {
-            content: `Ton ticket a été créé : <#${channel.id}>`,
-            flags: 64,
-          },
-        });
-      } catch (error) {
-        return Response.json({
-          type: 4,
-          data: {
-            content: "Impossible de créer ton ticket. Vérifie les permissions du bot.",
-            flags: 64,
-          },
-        });
-      }
+      // Create the ticket in the background
+      ctx.waitUntil(
+        (async () => {
+          try {
+            const channel = await createTicket(interaction, env);
+
+            await editOriginalResponse(
+              interaction,
+              `✅ Ton ticket a été créé : <#${channel.id}>`
+            );
+          } catch (error) {
+            console.error("Ticket creation failed:", error);
+
+            await editOriginalResponse(
+              interaction,
+              "❌ Impossible de créer ton ticket. Vérifie les permissions du bot ou contacte le staff."
+            );
+          }
+        })()
+      );
+
+      return immediateResponse;
     }
 
+    // Unknown interaction
     return Response.json({
       type: 4,
       data: {
